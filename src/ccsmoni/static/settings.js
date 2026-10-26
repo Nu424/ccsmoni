@@ -7,7 +7,8 @@
 //   - 行には画面内だけの _key を付ける。新規の id は書き換えられるので、id を行の目印にしない。
 
 import { api } from "./api.js";
-import { h, setChildren, spinner, toast, statusChip, bar, fmtPct, readableColor, cssVar, copyCmd } from "./ui.js";
+import { h, setChildren, spinner, toast, statusChip, bar, fmtPct } from "./ui.js";
+import { themePalette, setPalette, colorOf } from "./colors.js";
 
 let keySeq = 0;
 const newKey = () => `k${++keySeq}`;
@@ -25,8 +26,8 @@ export function createSettings(ctx) {
   const st = {
     loading: false, loadError: null,
     hash: null, path: null, fileError: null, candidates: [],
-    // 色はサーバーが決める（推移画面の色と一致させるため）。palette: 選べる色、colors: id → 解決済みの色
-    palette: [], colors: {},
+    // 色はサーバーが決める（推移画面の色と一致させるため）。slots: id → {color_slot, color}（保存済みの設定で解決したもの）
+    slots: {}, savedColors: {},
     historyIds: new Set(),    // 履歴があるアカウントの id（新しい id が重なったら注意を出す）
     readonly: null,           // claude_path / host / port（画面では変えられない。設定ファイルで編集する）
     knownHashes: new Set(),   // この画面で読み込んだ・保存した hash（state の config_hash がこれ以外なら外部の変更）
@@ -59,8 +60,9 @@ export function createSettings(ctx) {
       st.fileError = r.error;
       st.candidates = r.candidates || [];
       // 以下は新しいサーバーだけが返す。無ければ空として扱う
-      st.palette = Array.isArray(r.palette) ? r.palette.filter((c) => HEX.test(c)) : [];
-      st.colors = r.colors && typeof r.colors === "object" ? r.colors : {};
+      setPalette(r.palette);
+      st.slots = r.slots && typeof r.slots === "object" ? r.slots : {};
+      st.savedColors = Object.fromEntries((r.config.accounts || []).map((a) => [a.id, a.color ?? null]));
       st.historyIds = new Set(Array.isArray(r.history_ids) ? r.history_ids : []);
       st.readonly = r.readonly && typeof r.readonly === "object" ? r.readonly : null;
       st.form = clone(r.config);
@@ -141,7 +143,7 @@ export function createSettings(ctx) {
   const GLOBAL_FIELDS = {
     "collector.default_interval_minutes": "既定の取得間隔", "collector.timeout_seconds": "タイムアウト",
     "collector.concurrency": "同時実行数", "ui.warn_percent": "警告", "ui.danger_percent": "危険",
-    "server.port": "ポート", "server.host": "ホスト", "collector.discover_roots": "探す場所",
+    "ui.tiles_per_page": "1ページのタイル数", "server.port": "ポート", "server.host": "ホスト", "collector.discover_roots": "探す場所",
     "collector.claude_path": "claude の場所", "ui": "色のしきい値", "accounts": "アカウント",
   };
   // 画面に入力欄があるもの（claude_path / host / port は読み取り専用なので、エラーは保存バーの一覧に出す）
@@ -154,10 +156,12 @@ export function createSettings(ctx) {
     root = h("div.settings");
     el.append(root);
     document.addEventListener("keydown", onKey);
+    window.addEventListener("ccsmoni:theme", render);
     if (!st.form || !isDirty()) load(); else render();
   }
   function unmount() {
     document.removeEventListener("keydown", onKey);
+    window.removeEventListener("ccsmoni:theme", render);
     root = null;
   }
   function onKey(e) {
@@ -322,22 +326,22 @@ export function createSettings(ctx) {
     ]);
   }
 
-  // 色が空欄（自動）のときに実際に使われる色。サーバーが解決した色（推移画面と同じ）を優先し、
-  // 無ければ（新しい行・古いサーバー）推移画面の state の色、最後にパレットの順番で決める。
-  function autoColor(a, i) {
-    if (a.id && HEX.test(st.colors[a.id] || "")) return st.colors[a.id];
-    const live = a.id && ctx.store.server && ctx.store.server.accounts.find((x) => x.id === a.id);
-    if (live && HEX.test(live.color || "")) return live.color;
-    return st.palette.length ? st.palette[i % st.palette.length] : null;
+  // 行の色（いまのテーマでの hex）。色の指定: null＝自動、0〜6＝パレットの番号、"#rrggbb"＝独自の色
+  // 自動のときは、保存済みの設定でも自動だったならサーバーが決めた番号（推移画面と同じ）、そうでなければ並び順で仮に決める。
+  function rowColor(a, i) {
+    if (typeof a.color === "string" && HEX.test(a.color)) return a.color;
+    if (Number.isInteger(a.color)) return colorOf({ color_slot: a.color });
+    const saved = a.id && st.slots[a.id];
+    if (saved && st.savedColors[a.id] == null) return colorOf(saved);
+    return colorOf({ color_slot: i });
   }
 
   function accountRow(a, i, f) {
     const k = a._key;
     const open = st.open === k;
     const isNew = st.newKeys.has(k);
-    const bg = cssVar("--surface") || "#fff";
-    const explicit = a.color && HEX.test(a.color) ? a.color : null;
-    const color = explicit || autoColor(a, i);
+    const auto = a.color == null || a.color === "";
+    const color = rowColor(a, i);
     const nameEl = h("span.acct-name", a.label || "（名前なし）");
     const rowErr = [...st.errors.keys()].some((x) => x.startsWith(`acct:${k}:`));
 
@@ -349,8 +353,8 @@ export function createSettings(ctx) {
       h("span.drag-handle", { title: "ドラッグで並べ替え", "aria-hidden": "true",
         onmousedown: (e) => { e.currentTarget.closest(".acct-row").draggable = true; },
         onclick: (e) => e.stopPropagation() }, "⋮⋮"),
-      h("span.sw", { style: { background: color ? readableColor(color, bg) : "transparent" }, class: explicit ? "" : "is-auto",
-        title: explicit ? null : "自動で決めた色" }),
+      h("span.sw", { style: { background: color }, class: auto ? "is-auto" : "",
+        title: auto ? "自動で決めた色" : null }),
       h("span.acct-title", [nameEl, h("span.acct-id.mono", a.id || "（id 未入力）")]),
       rowErr ? h("span.chip.tone-danger", "要修正") : null,
       isNew ? h("span.chip.tone-info", "新規") : null,
@@ -408,15 +412,10 @@ export function createSettings(ctx) {
     const isNew = st.newKeys.has(k);
     const ek = (name) => `acct:${k}:${name}`;
     const head = () => root.querySelector(`.acct-row[data-key="${k}"]`);
-    const colorText = textInput(a, "color", { placeholder: "自動", nullable: true, errKey: ek("color"), mono: true,
-      onInput: (v) => { if (HEX.test(v)) { picker.value = v; paintSwatch(v); } } });
-    const picker = h("input.color-picker", { type: "color", value: (a.color && HEX.test(a.color) ? a.color : autoColor(a, i)) || "#888888",
-      "aria-label": "色を選ぶ",
-      oninput: (e) => { a.color = e.target.value; colorText.value = a.color; paintSwatch(a.color); changed(ek("color")); } });
-    const paintSwatch = (c) => {
+    const colorField = colorPicker(a, i, ek("color"), () => {
       const sw = head() && head().querySelector(".acct-head .sw");
-      if (sw) { sw.style.background = readableColor(c, cssVar("--surface") || "#fff"); sw.classList.remove("is-auto"); }
-    };
+      if (sw) { sw.style.background = rowColor(a, i); sw.classList.toggle("is-auto", a.color == null); }
+    });
     const test = st.tests.get(k);
 
     // 新しい id が過去の履歴の id と同じなら、続きとして記録される（エラーではないので、注意だけ出す）
@@ -443,10 +442,8 @@ export function createSettings(ctx) {
           { errKey: ek("config_dir"), wide: true, help: "~ や %USERPROFILE% も使えます。" }),
         field("起動コマンド", textInput(a, "launch_command", { nullable: true, errKey: ek("launch_command"), mono: true, placeholder: "例: claude-acct-a" }),
           { errKey: ek("launch_command"), help: "ログインの案内とコピー用です。ccsmoni が実行することはありません。" }),
-        field("色", h("span.color-row", [picker, colorText,
-          st.palette.length ? h("span.palette", st.palette.map((c) => h("button.pal", { type: "button", style: { background: c }, title: c, "aria-label": `色 ${c}`,
-            onclick: (e) => { e.preventDefault(); a.color = c; colorText.value = c; picker.value = c; paintSwatch(c); changed(ek("color")); } }))) : null]),
-          { errKey: ek("color"), div: true, help: "空欄なら自動で決めます。" }),
+        field("色", colorField,
+          { errKey: ek("color"), div: true, wide: true, help: "パレットの7色は、ライトとダークでそれぞれ見分けやすい色に切り替わります。独自の色は両方のテーマで同じ色です。" }),
         field("取得間隔", numInput(a, "interval_minutes", { nullable: true, errKey: ek("interval_minutes"), min: 1, max: 1440, unit: "分",
           placeholder: `既定（${f.collector.default_interval_minutes ?? 10}）` }),
           { errKey: ek("interval_minutes"), help: "空欄なら全体の既定値を使います。" }),
@@ -463,6 +460,42 @@ export function createSettings(ctx) {
           : h("button.btn.btn-ghost.btn-danger-text", { type: "button", onclick: () => { st.confirmDelete = k; render(); } }, "削除"),
       ]),
     ]);
+  }
+
+  // 色の選択: 自動｜パレット7色（いまのテーマの色で表示）｜独自の色
+  function colorPicker(a, i, errKey, onPaint) {
+    const pal = themePalette();
+    const wrap = h("div.color-choice", { role: "radiogroup", "aria-label": "色" });
+    const custom = typeof a.color === "string" && HEX.test(a.color) ? a.color : null;
+    const hexInput = h("input.mono.hex", { type: "text", spellcheck: "false", placeholder: "#rrggbb", value: custom || "", "aria-label": "独自の色（#rrggbb）",
+      oninput: (e) => {
+        const v = e.target.value.trim();
+        if (HEX.test(v)) { a.color = v.toLowerCase(); picker.value = a.color; paint(); }
+        else if (v === "") { a.color = null; paint(); }
+        else { a.color = v; changed(errKey); }
+      } });
+    const picker = h("input.color-picker", { type: "color", value: custom || rowColor(a, i), "aria-label": "独自の色を選ぶ", tabindex: "-1",
+      oninput: (e) => { a.color = e.target.value; hexInput.value = a.color; paint(); } });
+    const opt = (sel, label, attrs, kids) => h("button.cc", { type: "button", role: "radio", "aria-checked": String(sel), title: label, "aria-label": label, ...attrs }, kids);
+    const paint = () => {
+      for (const b of wrap.querySelectorAll(".cc")) {
+        const v = b.dataset.v;
+        const sel = v === "auto" ? a.color == null : v === "custom" ? typeof a.color === "string" : Number.isInteger(a.color) && String(a.color) === v;
+        b.setAttribute("aria-checked", String(sel));
+      }
+      wrap.classList.toggle("is-custom", typeof a.color === "string");
+      onPaint(); changed(errKey);
+    };
+    setChildren(wrap,
+      opt(a.color == null, "自動（並び順で決める）", { dataset: { v: "auto" }, onclick: () => { a.color = null; hexInput.value = ""; paint(); } }, h("span.cc-auto", "自動")),
+      pal.map((c, n) => opt(a.color === n, `パレットの ${n + 1} 番`, { dataset: { v: String(n) }, style: { "--sw": c }, onclick: () => { a.color = n; hexInput.value = ""; paint(); } }, h("span.cc-sw"))),
+      h("span.cc-custom", [opt(typeof a.color === "string", "独自の色", { dataset: { v: "custom" }, onclick: () => {
+        if (typeof a.color !== "string") { a.color = picker.value; hexInput.value = a.color; paint(); }
+        picker.click();
+      } }, [h("span.cc-sw.cc-rainbow"), h("span.cc-lbl", "独自")]), picker, hexInput]),
+    );
+    wrap.classList.toggle("is-custom", typeof a.color === "string");
+    return wrap;
   }
 
   async function runTest(a) {
@@ -492,14 +525,15 @@ export function createSettings(ctx) {
 
   function addAccount(cand) {
     const f = st.form;
-    // 使われている色（自動で決まった色も含む）と重ならない、パレットの最初の色。パレットが無ければ自動に任せる
-    const used = new Set(f.accounts.map((a, i) => (a.color && HEX.test(a.color) ? a.color : autoColor(a, i)) || "").map((c) => c.toLowerCase()));
+    // 使われている番号（自動で決まった番号も含む）と重ならない、パレットの最初の番号。全部使われていれば自動に任せる
+    const used = new Set(f.accounts.map((a) => (Number.isInteger(a.color) ? a.color : a.color == null && st.slots[a.id] ? st.slots[a.id].color_slot : null)));
+    const free = themePalette().findIndex((_, n) => !used.has(n));
     const a = {
       id: cand ? uniqueId(cand.suggested_id) : "",
       label: cand ? cand.suggested_id : "",
       config_dir: cand ? cand.config_dir : "",
       launch_command: null,
-      color: st.palette.find((c) => !used.has(c.toLowerCase())) || null,
+      color: free >= 0 ? free : null,
       interval_minutes: null,
       enabled: true,
       _key: newKey(),
@@ -581,6 +615,13 @@ export function createSettings(ctx) {
           { errKey: "collector.timeout_seconds", help: "1回の取得をあきらめるまでの時間です。" }),
         field("同時実行数", numInput(c, "concurrency", { min: 1, max: 8, errKey: "collector.concurrency" }),
           { errKey: "collector.concurrency", help: "いくつのアカウントを同時に取りに行くか。" }),
+        field("1ページのタイル数", h("div.seg.tpp", { role: "group", "aria-label": "1ページのタイル数" }, [4, 6, 8, 9, 12].map((n) =>
+          h("button", { type: "button", "aria-pressed": String((ui.tiles_per_page ?? 6) === n), onclick: (e) => {
+            ui.tiles_per_page = n;
+            for (const b of e.currentTarget.parentElement.children) b.setAttribute("aria-pressed", String(b === e.currentTarget));
+            changed("ui.tiles_per_page");
+          } }, String(n)))),
+          { errKey: "ui.tiles_per_page", div: true, help: "アカウントがこれより多いときだけ、ページに分けます。" }),
         h("div.field.is-wide", { class: uiErr ? "has-error" : "" }, [
           h("span.field-label", "使用率の色"),
           h("div.th-row", [

@@ -5,8 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>ccsmoni</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f8cff'/%3E%3Cpath d='M6 22 L12 15 L17 19 L26 9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="vendor/uPlot.min.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23141413'/%3E%3Cpath d='M6 22 L12 15 L17 19 L26 9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
   <script>
     // 描画前にテーマを決める（ちらつき防止）。保存がなければ OS の設定に従う。
@@ -14,27 +13,27 @@
   </script>
 </head>
 <body>
-  <header class="app-header">
-    <div class="header-inner">
+  <div class="app">
+    <header class="topbar">
       <a class="brand" href="#/" aria-label="ccsmoni トップ">
-        <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M6 22 L12 15 L17 19 L26 9" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="brand-mark"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 12l4-4 3 3 5-6"/></svg></span>
         <span>ccsmoni</span>
       </a>
-      <nav class="tabs" aria-label="画面">
+      <nav class="nav" aria-label="画面">
         <a href="#/" data-route="dash">推移</a>
         <a href="#/settings" data-route="settings">設定</a>
       </nav>
-      <div class="header-right">
-        <div class="run-info" id="run-info" aria-live="polite"></div>
-        <button class="btn btn-primary" id="refresh-btn" type="button">
-          <span class="btn-icon" aria-hidden="true"></span><span class="btn-label">今すぐ更新</span>
-        </button>
-        <button class="icon-btn" id="theme-btn" type="button" aria-label="テーマの切り替え" title="テーマの切り替え"></button>
-      </div>
-    </div>
-  </header>
-  <div id="banner" class="banner-slot"></div>
-  <main id="view"></main>
+      <span class="sep"></span>
+      <div class="badges" id="badges" role="group" aria-label="アカウントの状態"></div>
+      <span class="grow"></span>
+      <div class="fresh" id="fresh" aria-live="polite"></div>
+      <button class="btn" id="refresh-btn" type="button"></button>
+      <button class="icon-btn" id="theme-btn" type="button"></button>
+    </header>
+    <div id="banner" class="banner-slot"></div>
+    <main id="view"></main>
+  </div>
+  <div class="ttip" id="tip" role="status" aria-live="polite"></div>
   <div id="toasts" class="toasts" aria-live="polite"></div>
   <script type="module" src="app.js"></script>
 </body>

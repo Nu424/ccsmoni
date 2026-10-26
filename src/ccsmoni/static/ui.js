@@ -229,44 +229,45 @@ export function copyCmd(text) {
   ]);
 }
 
-// ---- 色 -----------------------------------------------------------------
-// アカウントの色はサーバーから来る（ユーザーが自由に決める）。背景に対して読めないほど
-// 暗い／明るい色は、明度だけ調整して線や印に使う（色相は保つので見分けはつく）。
-function hexToRgb(hex) {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
-  if (!m) return [136, 136, 136];
-  const n = parseInt(m[1], 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-function lum([r, g, b]) {
-  const f = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
-  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
-}
-function contrast(a, b) {
-  const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p);
-  return (x + 0.05) / (y + 0.05);
-}
-function mix(rgb, target, t) {
-  return rgb.map((c, i) => Math.round(c + (target[i] - c) * t));
-}
-const cache = new Map();
-export function readableColor(hex, bgHex) {
-  const key = hex + bgHex;
-  if (cache.has(key)) return cache.get(key);
-  const bg = hexToRgb(bgHex);
-  let rgb = hexToRgb(hex);
-  const toward = lum(bg) < 0.2 ? [255, 255, 255] : [0, 0, 0];
-  for (let i = 0; i < 10 && contrast(rgb, bg) < 3; i++) rgb = mix(rgb, toward, 0.18);
-  const out = "#" + rgb.map((c) => c.toString(16).padStart(2, "0")).join("");
-  cache.set(key, out);
-  return out;
-}
-export function withAlpha(hex, a) {
-  const [r, g, b] = hexToRgb(hex);
-  return `rgba(${r},${g},${b},${a})`;
+// ---- アイコン（16px の線画。currentColor で塗る） ------------------------------
+const ICONS = {
+  warn: '<path d="M8 2.2 14.5 13.5h-13z"/><path d="M8 6.5v3M8 11.6v.1"/>',
+  crit: '<circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>',
+  err: '<circle cx="8" cy="8" r="6"/><path d="M8 4.8v3.6M8 10.8v.1"/>',
+  tip: '<path d="M6 12.5h4M6.5 14.5h3M8 1.8a4.2 4.2 0 0 0-2.4 7.7c.5.4.8.9.8 1.5h3.2c0-.6.3-1.1.8-1.5A4.2 4.2 0 0 0 8 1.8z"/>',
+  ok: '<path d="M3 8.5l3 3 7-7"/>',
+  refresh: '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/>',
+  clock: '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.2 1.6"/>',
+  off: '<circle cx="8" cy="8" r="6"/><path d="M3.8 12.2l8.4-8.4"/>',
+  x: '<path d="M4 4l8 8M12 4l-8 8"/>',
+  left: '<path d="M10 3.5 5.5 8l4.5 4.5"/>',
+  right: '<path d="M6 3.5 10.5 8 6 12.5"/>',
+  zoom: '<circle cx="7" cy="7" r="4.5"/><path d="M10.4 10.4 14 14M5 7h4M7 5v4"/>',
+  moon: '<path d="M13 9.5A5.5 5.5 0 0 1 6.5 3a5.5 5.5 0 1 0 6.5 6.5z"/>',
+  sun: '<circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/>',
+  key: '<circle cx="5.5" cy="10.5" r="3"/><path d="M7.7 8.3 13.5 2.5M11.5 4.5l1.8 1.8"/>',
+  plus: '<path d="M8 3v10M3 8h10"/>',
+};
+export function icon(name, cls = "i") {
+  const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  s.setAttribute("viewBox", "0 0 16 16");
+  s.setAttribute("class", cls);
+  s.setAttribute("aria-hidden", "true");
+  s.innerHTML = ICONS[name] || "";
+  return s;
 }
 
 // CSS 変数（テーマのトークン）を JS 側で読む。canvas に描くグラフで使う。
 export function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// 「6時間20分」「2日 4時間」（長さ。範囲の表示・ドラッグ中の表示に使う）
+export function fmtSpan(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const d = Math.floor(sec / 86400), hh = Math.floor((sec % 86400) / 3600), mm = Math.floor((sec % 3600) / 60);
+  if (d >= 3) return hh ? `${d}日 ${hh}時間` : `${d}日`;
+  if (d > 0) return !hh && !mm ? `${d}日` : `${d}日 ${hh}時間${mm && d < 2 ? `${mm}分` : ""}`;
+  if (hh > 0) return mm ? `${hh}時間${mm}分` : `${hh}時間`;
+  return `${Math.max(1, mm)}分`;
 }

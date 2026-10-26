@@ -10,8 +10,8 @@ export class ApiError extends Error {
   }
 }
 
-async function req(method, path, body) {
-  const opt = { method, headers: {} };
+async function req(method, path, body, signal) {
+  const opt = { method, headers: {}, signal };
   if (body !== undefined) {
     opt.headers["Content-Type"] = "application/json";
     opt.body = JSON.stringify(body);
@@ -20,6 +20,7 @@ async function req(method, path, body) {
   try {
     res = await fetch(path, opt);
   } catch (e) {
+    if (e && e.name === "AbortError") throw e;
     throw new ApiError(0, { error: "サーバーに接続できません" });
   }
   let data = null;
@@ -33,8 +34,9 @@ async function req(method, path, body) {
 
 export const api = {
   state: () => req("GET", "/api/state"),
-  history: (range, kinds) => req("GET", `/api/history?range=${range}&kinds=${kinds.join(",")}`),
-  windows: (kind = "weekly_all", limit = 8) => req("GET", `/api/windows?kind=${kind}&limit=${limit}`),
+  // 表示範囲（＋余白）を epoch 秒で取る。範囲は最大 120 日（超えると 422）
+  history: (since, until, signal) =>
+    req("GET", `/api/history?since=${Math.floor(since)}&until=${Math.ceil(until)}&kinds=weekly_all,session`, undefined, signal),
   refresh: (accountId) => req("POST", "/api/refresh", accountId ? { account_id: accountId } : {}),
   getConfig: () => req("GET", "/api/config"),
   putConfig: (config, hash) => req("PUT", "/api/config", { config, hash }),

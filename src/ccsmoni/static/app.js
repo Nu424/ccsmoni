@@ -1,20 +1,20 @@
 // アプリ全体の骨組み。
-// 何を: ハッシュルーティング（#/ と #/settings）、/api/state の定期取得、ヘッダー（最終更新・次回・今すぐ更新・テーマ）、
+// 何を: ハッシュルーティング（#/ と #/settings）、/api/state の定期取得、ヘッダー（状態のバッジ・最終更新・次回・今すぐ更新・テーマ）、
 //       毎秒の時刻表示の更新。
 // なぜ: 画面ごとの処理（dashboard.js / settings.js）から「いつ取りに行くか」「時計」を切り離し、
 //       どの画面でも同じリズムで状態が新しくなるようにするため。
-// 方針: store（1つのオブジェクト）に最新のサーバー状態を入れ、変わったら今の画面の onState() を呼ぶ。
-//       画面は mount / unmount / onState を持つ小さなオブジェクト。
+// 方針: store に最新のサーバー状態を入れ、変わったら今の画面の onState() を呼ぶ。画面は mount / unmount / onState を持つ。
 
 import { api } from "./api.js";
-import { h, setChildren, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref, loginRetaken } from "./ui.js";
+import { h, setChildren, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref, loginRetaken, icon } from "./ui.js";
 import { createDashboard } from "./dashboard.js";
 import { createSettings } from "./settings.js";
+import { setPalette } from "./colors.js";
 
 const store = {
-  server: null,          // 最後に取れた /api/state
+  server: null,
   clockOffset: 0,        // サーバー時刻 − ブラウザ時刻（秒）。カウントダウンをサーバー基準にする
-  connError: false,      // 直近の取得に失敗したか
+  connError: false,
   refreshPending: false, // ［今すぐ更新］を押してから、busy が空に戻るまで
   refreshSawBusy: false,
   refreshStartedAt: 0,
@@ -33,7 +33,6 @@ let currentName = null;
 const viewEl = document.getElementById("view");
 
 // ---- ルーティング ------------------------------------------------------------
-// 設定に未保存の変更があるときは、離れる前に確認する（戻るとそのまま編集を続けられる）。
 function routeName() {
   return location.hash.startsWith("#/settings") ? "settings" : "dash";
 }
@@ -53,11 +52,12 @@ function route() {
   viewEl.replaceChildren();
   currentName = name;
   current = views[name];
+  document.body.dataset.route = name;
   current.mount(viewEl);
   if (store.server) current.onState(store.server);
-  document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.route === name ? "page" : "false"));
-  window.scrollTo(0, 0);
-  renderBanner(); // 設定画面では「設定ファイルに誤り」の帯を画面側に任せるので、移動のたびに出し直す
+  document.querySelectorAll(".nav a").forEach((a) => a.setAttribute("aria-current", a.dataset.route === name ? "page" : "false"));
+  viewEl.scrollTo && viewEl.scrollTo(0, 0);
+  renderBanner();
 }
 window.addEventListener("hashchange", route);
 window.addEventListener("beforeunload", (e) => {
@@ -78,6 +78,7 @@ async function pollNow() {
     store.clockOffset = s.now - Date.now() / 1000;
     store.server = s;
     store.connError = false;
+    setPalette(s.palette);
     trackRefresh(prev, s);
     current && current.onState(s, prev);
   } catch {
@@ -94,12 +95,10 @@ function fastPoll() {
   if (!s) return true;
   return s.collector.busy.length > 0 || s.accounts.some((a) => a.login && a.login.state === "waiting") ||
     s.accounts.some((a) => a.login && a.login.state === "done" && !loginRetaken(a));
-
 }
 
 // ---- 今すぐ更新 ---------------------------------------------------------------
-// 押す → POST /api/refresh → busy が出て、空に戻ったら完了。busy が一度も見えないまま
-// 8 秒たったら（取得が一瞬で終わった等）完了とみなす。
+// 押す → POST /api/refresh → busy が出て、空に戻ったら完了。busy が一度も見えないまま 8 秒たったら完了とみなす。
 async function startRefresh(accountId) {
   if (store.refreshPending) return;
   store.refreshPending = true;
@@ -133,29 +132,64 @@ function trackRefresh(prev, s) {
 }
 
 // ---- ヘッダー ---------------------------------------------------------------------
-const runInfo = document.getElementById("run-info");
+const runInfo = document.getElementById("fresh");
 const refreshBtn = document.getElementById("refresh-btn");
+const badgesEl = document.getElementById("badges");
 refreshBtn.addEventListener("click", () => startRefresh());
+
+// 状態のバッジ（有効なアカウントだけを数える）。ホバーで該当するタイルを強調、押すとそのページへ
+function badgeGroups(s) {
+  const acc = s.accounts.filter((a) => a.enabled);
+  const warnP = s.ui.warn_percent;
+  const ids = (f) => acc.filter(f).map((a) => a.id);
+  const lo = ids((a) => a.status === "logged_out");
+  const er = ids((a) => a.status !== "ok" && a.status !== "never" && a.status !== "logged_out");
+  const wa = ids((a) => a.status === "ok" && ((a.limits || []).some((l) => l.percent >= warnP) || (a.hints || []).some((x) => x.kind === "will_hit_limit")));
+  const tp = ids((a) => a.status === "ok" && (a.hints || []).some((x) => x.kind === "use_it_or_lose_it"));
+  const bad = new Set([...lo, ...er, ...wa]);
+  const ok = acc.filter((a) => !bad.has(a.id) && a.status === "ok").map((a) => a.id);
+  return [
+    { k: "ok", icon: "ok", label: "問題なし", ids: ok, text: `${ok.length}/${acc.length}`, always: true },
+    { k: "crit", icon: "crit", label: "ログイン切れ", ids: lo },
+    { k: "crit", icon: "err", label: "取得エラー", ids: er },
+    { k: "warn", icon: "warn", label: "上限見込み", ids: wa },
+    { k: "tip", icon: "tip", label: "使い残し", ids: tp },
+  ];
+}
+function renderBadges(s) {
+  if (!s) { badgesEl.replaceChildren(); return; }
+  const label = (id) => (s.accounts.find((a) => a.id === id) || {}).label || id;
+  const items = badgeGroups(s).filter((g) => g.always || g.ids.length).map((g) => h("button.chip", {
+    type: "button", class: g.k, dataset: { ids: g.ids.join(",") },
+    title: g.ids.length ? `${g.ids.map(label).join("・")}（押すとそのアカウントへ）` : g.label,
+    "aria-label": `${g.label} ${g.ids.length}件: ${g.ids.map(label).join("、")}`,
+    onpointerenter: () => views.dash.highlight(g.ids),
+    onpointerleave: () => views.dash.highlight(null),
+    onfocus: () => views.dash.highlight(g.ids),
+    onblur: () => views.dash.highlight(null),
+    onclick: () => {
+      if (!g.ids.length) return;
+      if (currentName !== "dash") location.hash = "#/";
+      requestAnimationFrame(() => views.dash.gotoAccount(g.ids[0]));
+    },
+  }, [icon(g.icon), g.label, " ", h("b", g.text || String(g.ids.length))]));
+  const off = s.accounts.filter((a) => !a.enabled).length;
+  if (off) items.push(h("a.chip.off", { href: "#/settings", title: "無効にしたアカウントは推移に出しません。設定で有効にできます" }, [icon("off"), "無効 ", h("b", String(off))]));
+  setChildren(badgesEl, items);
+}
 
 function renderHeader() {
   const s = store.server;
   const busy = store.refreshPending || (s && s.collector.busy.length > 0);
   refreshBtn.disabled = !!busy;
   refreshBtn.classList.toggle("is-busy", !!busy);
-  setChildren(refreshBtn.querySelector(".btn-icon"), busy ? spinner() : refreshIcon());
-  refreshBtn.querySelector(".btn-label").textContent = busy ? "更新中…" : "今すぐ更新";
+  setChildren(refreshBtn, busy ? spinner() : icon("refresh"), h("span.lbl", busy ? "更新中…" : "今すぐ更新"));
+  renderBadges(s);
   if (!s) { runInfo.replaceChildren(); return; }
   const now = ctx.now();
-  const parts = [
-    h("span.ri-item", { title: "最後に取得した時刻" }, [h("span.ri-k", "最終更新"), " ",
-      h("b.num", { dataset: { ago: s.collector.last_run_at || "" } }, fmtAgo(s.collector.last_run_at, now))]),
-  ];
-  if (s.collector.busy.length) {
-    parts.push(h("span.ri-item.is-busy", `取得中 ${s.collector.busy.length}件`));
-  } else if (s.collector.next_run_at) {
-    parts.push(h("span.ri-item.hide-sm", [h("span.ri-k", "次回"), " ",
-      h("b.num", { dataset: { in: s.collector.next_run_at } }, fmtIn(s.collector.next_run_at, now))]));
-  }
+  const parts = [h("span", { title: "最後に取得した時刻" }, ["最終更新 ", h("b.num", { dataset: { ago: s.collector.last_run_at || "" } }, fmtAgo(s.collector.last_run_at, now))])];
+  if (s.collector.busy.length) parts.push(h("span.busy", [spinner(), `取得中 ${s.collector.busy.length}件`]));
+  else if (s.collector.next_run_at) parts.push(h("span", ["次回 ", h("b.num", { dataset: { in: s.collector.next_run_at } }, fmtIn(s.collector.next_run_at, now))]));
   setChildren(runInfo, ...parts);
 }
 function flashRunInfo() {
@@ -163,70 +197,44 @@ function flashRunInfo() {
   void runInfo.offsetWidth;
   runInfo.classList.add("flash");
 }
-function refreshIcon() {
-  const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  s.setAttribute("viewBox", "0 0 16 16");
-  s.setAttribute("width", "14");
-  s.setAttribute("height", "14");
-  s.innerHTML = '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.6 1.6v3.1H9.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>';
-  return s;
-}
 
 // ---- お知らせの帯（接続できない・設定ファイルが壊れている） ----------------------------
 const bannerEl = document.getElementById("banner");
 function renderBanner() {
   const items = [];
-  if (store.connError) {
-    items.push(h("div.banner.tone-danger", [spinner(), " サーバーに接続できません。再接続しています…"]));
-  }
+  if (store.connError) items.push(h("div.banner.tone-danger", [spinner(), " サーバーに接続できません。再接続しています…"]));
   const ce = store.server && store.server.config_error;
-  // 設定画面は同じ内容を画面の中の帯で出す（2つ並ばないように、こちらは出さない）
   if (ce && currentName !== "settings") {
-    items.push(h("div.banner.tone-warn", [
-      h("b", "設定ファイルに誤りがあります。"), " 最後に有効だった設定で動いています。 ",
-      h("span.banner-detail", ce), " ", h("a", { href: "#/settings" }, "設定を開く"),
-    ]));
+    items.push(h("div.banner.tone-warn", [h("b", "設定ファイルに誤りがあります。"), " 最後に有効だった設定で動いています。 ",
+      h("span.banner-detail", ce), " ", h("a", { href: "#/settings" }, "設定を開く")]));
   }
   setChildren(bannerEl, ...items);
 }
 
 // ---- 毎秒の時刻表示 --------------------------------------------------------------
-// data-ago / data-in / data-until を持つ要素の文字だけを書き換える（再描画はしない）。
 function tick() {
   const now = ctx.now();
-  for (const el of document.querySelectorAll("[data-ago]")) {
-    const t = +el.dataset.ago; if (t) el.textContent = fmtAgo(t, now);
-  }
-  for (const el of document.querySelectorAll("[data-in]")) {
-    const t = +el.dataset.in; if (t) el.textContent = fmtIn(t, now);
-  }
+  for (const el of document.querySelectorAll("[data-ago]")) { const t = +el.dataset.ago; if (t) el.textContent = fmtAgo(t, now); }
+  for (const el of document.querySelectorAll("[data-in]")) { const t = +el.dataset.in; if (t) el.textContent = fmtIn(t, now); }
   for (const el of document.querySelectorAll("[data-until]")) {
-    const t = +el.dataset.until;
-    const s = fmtCountdown(t, now);
+    const s = fmtCountdown(+el.dataset.until, now);
     el.textContent = s || "リセット済み（推定）";
     el.classList.toggle("is-past", !s);
   }
-  // 待ち時間が長いときにボタンの表示が止まって見えないよう、ヘッダーも毎秒見直す
-  if (store.refreshPending && Date.now() - store.refreshStartedAt > 30000) {
-    store.refreshPending = false;
-    renderHeader();
-  }
+  if (store.refreshPending && Date.now() - store.refreshStartedAt > 30000) { store.refreshPending = false; renderHeader(); }
 }
 setInterval(tick, 1000);
+// 追従中の表示範囲を今に合わせる（state の取得の合間にも、右端が止まって見えないように）
+setInterval(() => { if (currentName === "dash") views.dash.vp.tick(); }, 30000);
 
 // ---- テーマ ----------------------------------------------------------------------
-// OS の設定に従うのが既定。ボタンで反対側に切り替え、もう一度押すと戻る。
-// 切り替えた結果が OS の設定と同じになったら、保存を消して「OS に従う」に戻す。
+// OS の設定に従うのが既定。ボタンで反対側に切り替え、OS と同じになったら保存を消して「OS に従う」に戻す。
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
 const themeBtn = document.getElementById("theme-btn");
-function effectiveTheme() {
-  return document.documentElement.dataset.theme || (mq.matches ? "dark" : "light");
-}
+const effectiveTheme = () => document.documentElement.dataset.theme || (mq.matches ? "dark" : "light");
 function renderThemeBtn() {
   const dark = effectiveTheme() === "dark";
-  themeBtn.innerHTML = dark
-    ? '<svg viewBox="0 0 20 20" width="18" height="18"><circle cx="10" cy="10" r="3.6" fill="currentColor"/><g stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></g></svg>'
-    : '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M16.5 12.6A7 7 0 0 1 7.4 3.5a7 7 0 1 0 9.1 9.1z" fill="currentColor"/></svg>';
+  setChildren(themeBtn, icon(dark ? "sun" : "moon"));
   themeBtn.title = dark ? "ライトにする" : "ダークにする";
   themeBtn.setAttribute("aria-label", themeBtn.title);
 }
@@ -234,13 +242,13 @@ themeBtn.addEventListener("click", () => {
   const next = effectiveTheme() === "dark" ? "light" : "dark";
   const system = mq.matches ? "dark" : "light";
   if (next === system) { delete document.documentElement.dataset.theme; savePref("theme", undefined); }
-  // テーマだけは index.html が描画前に生の文字列で読むので、JSON にせずそのまま保存する
   else { document.documentElement.dataset.theme = next; try { localStorage.setItem("ccsmoni.theme", next); } catch {} }
   themeChanged();
 });
 mq.addEventListener("change", () => { if (!document.documentElement.dataset.theme) themeChanged(); });
 function themeChanged() {
   renderThemeBtn();
+  renderHeader();
   window.dispatchEvent(new CustomEvent("ccsmoni:theme"));
 }
 
@@ -249,3 +257,5 @@ renderThemeBtn();
 renderHeader();
 route();
 pollNow();
+// 開発・確認用（スクリーンショットの操作に使う）
+window.__ccs = { ctx, views };
