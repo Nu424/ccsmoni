@@ -156,26 +156,63 @@ function badgeGroups(s) {
     { k: "tip", icon: "tip", label: "使い残し", ids: tp },
   ];
 }
+// バッジは group の種類ごとに要素を持ち続け、中身だけ更新する（ポーリングのたびに作り直すとフォーカスが外れるため）。
+// 押すたびに、該当するアカウントへ順に移る（ページも移る）。何件目かを「1/2」のように少しのあいだ出す。
+const badgeEls = new Map();   // key → { el, ids, cursor, posTimer }
+function badgeKey(g) { return `${g.k}:${g.icon}`; }
 function renderBadges(s) {
-  if (!s) { badgesEl.replaceChildren(); return; }
+  if (!s) { badgesEl.replaceChildren(); badgeEls.clear(); return; }
   const label = (id) => (s.accounts.find((a) => a.id === id) || {}).label || id;
-  const items = badgeGroups(s).filter((g) => g.always || g.ids.length).map((g) => h("button.chip", {
-    type: "button", class: g.k, dataset: { ids: g.ids.join(",") },
-    title: g.ids.length ? `${g.ids.map(label).join("・")}（押すとそのアカウントへ）` : g.label,
-    "aria-label": `${g.label} ${g.ids.length}件: ${g.ids.map(label).join("、")}`,
-    onpointerenter: () => views.dash.highlight(g.ids),
-    onpointerleave: () => views.dash.highlight(null),
-    onfocus: () => views.dash.highlight(g.ids),
-    onblur: () => views.dash.highlight(null),
-    onclick: () => {
-      if (!g.ids.length) return;
-      if (currentName !== "dash") location.hash = "#/";
-      requestAnimationFrame(() => views.dash.gotoAccount(g.ids[0]));
-    },
-  }, [icon(g.icon), g.label, " ", h("b", g.text || String(g.ids.length))]));
+  const groups = badgeGroups(s).filter((g) => g.always || g.ids.length);
+  const kids = [];
+  for (const g of groups) {
+    const key = badgeKey(g);
+    let b = badgeEls.get(key);
+    if (!b) {
+      b = { ids: [], cursor: -1, posTimer: 0 };
+      b.count = h("b");
+      b.pos = h("span.pos", { hidden: true });
+      b.el = h("button.chip", {
+        type: "button", class: g.k,
+        onpointerenter: () => views.dash.highlight(b.ids),
+        onpointerleave: () => views.dash.highlight(null),
+        onfocus: () => views.dash.highlight(b.ids),
+        onblur: () => views.dash.highlight(null),
+        onclick: () => cycleBadge(b),
+      }, [icon(g.icon), h("span.bl", g.label), " ", b.count, b.pos]);
+      badgeEls.set(key, b);
+    }
+    if (b.ids.join(",") !== g.ids.join(",")) b.cursor = -1; // 対象が変わったら最初から
+    b.ids = g.ids;
+    const text = g.text || String(g.ids.length);
+    if (b.count.textContent !== text) b.count.textContent = text;
+    b.el.title = g.ids.length ? `${g.ids.map(label).join("・")}（押すたびに順に移動）` : g.label;
+    b.el.setAttribute("aria-label", `${g.label} ${g.ids.length}件: ${g.ids.map(label).join("、")}`);
+    kids.push(b.el);
+  }
+  const keys = new Set(groups.map(badgeKey));
+  for (const k of [...badgeEls.keys()]) if (!keys.has(k)) badgeEls.delete(k);
   const off = s.accounts.filter((a) => !a.enabled).length;
-  if (off) items.push(h("a.chip.off", { href: "#/settings", title: "無効にしたアカウントは推移に出しません。設定で有効にできます" }, [icon("off"), "無効 ", h("b", String(off))]));
-  setChildren(badgesEl, items);
+  if (off) {
+    if (!badgesEl._off) badgesEl._off = h("a.chip.off", { href: "#/settings", title: "無効にしたアカウントは推移に出しません。設定で有効にできます" }, [icon("off"), h("span.bl", "無効 "), h("b")]);
+    badgesEl._off.querySelector("b").textContent = String(off);
+    kids.push(badgesEl._off);
+  }
+  const cur = [...badgesEl.children];
+  if (cur.length !== kids.length || cur.some((x, i) => x !== kids[i])) badgesEl.replaceChildren(...kids);
+}
+function cycleBadge(b) {
+  if (!b.ids.length) return;
+  b.cursor = (b.cursor + 1) % b.ids.length;
+  const id = b.ids[b.cursor];
+  if (currentName !== "dash") location.hash = "#/";
+  requestAnimationFrame(() => views.dash.gotoAccount(id));
+  if (b.ids.length > 1) {
+    b.pos.textContent = `${b.cursor + 1}/${b.ids.length}`;
+    b.pos.hidden = false;
+    clearTimeout(b.posTimer);
+    b.posTimer = setTimeout(() => { b.pos.hidden = true; }, 2200);
+  }
 }
 
 function renderHeader() {
@@ -183,13 +220,22 @@ function renderHeader() {
   const busy = store.refreshPending || (s && s.collector.busy.length > 0);
   refreshBtn.disabled = !!busy;
   refreshBtn.classList.toggle("is-busy", !!busy);
-  setChildren(refreshBtn, busy ? spinner() : icon("refresh"), h("span.lbl", busy ? "更新中…" : "今すぐ更新"));
+  // 押したボタンからフォーカスが外れないよう、状態が変わったときだけ中身を入れ替える
+  if (refreshBtn.dataset.busy !== String(!!busy)) {
+    refreshBtn.dataset.busy = String(!!busy);
+    setChildren(refreshBtn, busy ? spinner() : icon("refresh"), h("span.lbl", busy ? "更新中…" : "今すぐ更新"));
+  }
   renderBadges(s);
-  if (!s) { runInfo.replaceChildren(); return; }
+  if (!s) { runInfo.replaceChildren(); delete runInfo.dataset.k; return; }
   const now = ctx.now();
-  const parts = [h("span", { title: "最後に取得した時刻" }, ["最終更新 ", h("b.num", { dataset: { ago: s.collector.last_run_at || "" } }, fmtAgo(s.collector.last_run_at, now))])];
-  if (s.collector.busy.length) parts.push(h("span.busy", [spinner(), `取得中 ${s.collector.busy.length}件`]));
-  else if (s.collector.next_run_at) parts.push(h("span", ["次回 ", h("b.num", { dataset: { in: s.collector.next_run_at } }, fmtIn(s.collector.next_run_at, now))]));
+  // 狭い画面（1180px 未満）では「最終更新」の文字と次回を省き、「2分前」だけを残す（CSS）
+  const nb = s.collector.busy.length;
+  const fk = JSON.stringify([s.collector.last_run_at, nb, nb ? null : s.collector.next_run_at]);
+  if (runInfo.dataset.k === fk) return;
+  runInfo.dataset.k = fk;
+  const parts = [h("span", { title: "最後に取得した時刻" }, [h("span.lbl", "最終更新 "), h("b.num", { dataset: { ago: s.collector.last_run_at || "" } }, fmtAgo(s.collector.last_run_at, now))])];
+  if (nb) parts.push(h("span.busy", [spinner(), h("span.lbl", "取得中 "), `${nb}件`]));
+  else if (s.collector.next_run_at) parts.push(h("span.next", ["次回 ", h("b.num", { dataset: { in: s.collector.next_run_at } }, fmtIn(s.collector.next_run_at, now))]));
   setChildren(runInfo, ...parts);
 }
 function flashRunInfo() {
@@ -248,6 +294,7 @@ themeBtn.addEventListener("click", () => {
 mq.addEventListener("change", () => { if (!document.documentElement.dataset.theme) themeChanged(); });
 function themeChanged() {
   renderThemeBtn();
+  delete runInfo.dataset.k;
   renderHeader();
   window.dispatchEvent(new CustomEvent("ccsmoni:theme"));
 }
@@ -257,5 +304,3 @@ renderThemeBtn();
 renderHeader();
 route();
 pollNow();
-// 開発・確認用（スクリーンショットの操作に使う）
-window.__ccs = { ctx, views };

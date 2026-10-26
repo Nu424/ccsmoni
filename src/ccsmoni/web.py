@@ -231,6 +231,24 @@ def _dt(t: float) -> datetime:
     return datetime.fromtimestamp(t, UTC)
 
 
+def _snapshot_spans(snaps: list[tuple[str, int, str]], since: int, until: int) -> list[dict]:
+    """範囲内の取得（状態・kind を問わない）の最初と最後の時刻（アカウントごと）。
+
+    UI は取得した範囲ごとに gaps をキャッシュする。範囲の境目をまたぐ抜けは、どちらの応答の gaps にも入らないので、
+    境目の両側の「最後・最初の取得」をこれで知り、手元で判定する（weekly_model:* だけの取得も数に入れるため）。
+    """
+    first: dict[str, int] = {}
+    last: dict[str, int] = {}
+    for account_id, t, _status in snaps:
+        if not since <= t <= until:
+            continue
+        if account_id not in first or t < first[account_id]:
+            first[account_id] = t
+        if account_id not in last or t > last[account_id]:
+            last[account_id] = t
+    return [{"account_id": a, "first": first[a], "last": last[a]} for a in sorted(first)]
+
+
 def _csv(v: str | None) -> list[str] | None:
     if v is None:
         return None
@@ -383,13 +401,15 @@ def create_app(
 
         def work() -> dict:
             rows = services.store.history(_dt(since), _dt(now), account_ids=account_ids, kinds=kind_list)
-            snaps = services.store.snapshot_times(_dt(since), account_ids=account_ids)
+            snaps = services.store.snapshot_times(_dt(since), account_ids=account_ids, until=_dt(now))
             intervals = {a.id: rt.cfg.interval_for(a.id) for a in rt.cfg.accounts}
-            return insights.history_series(
+            out = insights.history_series(
                 rows, snaps, since, now, intervals,
                 default_interval=rt.cfg.collector.default_interval_minutes,
                 account_order=[a.id for a in rt.cfg.accounts],
             )
+            out["spans"] = _snapshot_spans(snaps, since, now)
+            return out
 
         return await asyncio.to_thread(work)
 

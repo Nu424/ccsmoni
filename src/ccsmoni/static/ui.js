@@ -267,7 +267,10 @@ export function fmtSpan(sec) {
   sec = Math.max(0, Math.round(sec));
   const d = Math.floor(sec / 86400), hh = Math.floor((sec % 86400) / 3600), mm = Math.floor((sec % 3600) / 60);
   if (d >= 3) return hh ? `${d}日 ${hh}時間` : `${d}日`;
-  if (d > 0) return !hh && !mm ? `${d}日` : `${d}日 ${hh}時間${mm && d < 2 ? `${mm}分` : ""}`;
+  if (d > 0) {
+    const m = mm && d < 2 ? `${mm}分` : "";
+    return hh ? `${d}日 ${hh}時間${m}` : m ? `${d}日 ${m}` : `${d}日`;
+  }
   if (hh > 0) return mm ? `${hh}時間${mm}分` : `${hh}時間`;
   return `${Math.max(1, mm)}分`;
 }

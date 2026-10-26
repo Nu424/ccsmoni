@@ -260,7 +260,11 @@ def test_history_and_windows(env):
     weekly = next(s for s in d["series"] if s["kind"] == "weekly_all")
     assert [p[1] for p in weekly["segments"][0]["points"]] == [10, 11, 12]
     assert d["errors"] == [{"account_id": "b", "t": int((NOW - timedelta(hours=1)).timestamp()), "status": "logged_out"}]
-    assert set(d) == {"since", "until", "series", "resets", "gaps", "errors"}
+    assert set(d) == {"since", "until", "series", "resets", "gaps", "errors", "spans"}
+    # spans: 範囲内の取得（状態を問わない）の最初と最後
+    a0 = int((NOW - timedelta(hours=3)).timestamp())
+    b0 = int((NOW - timedelta(hours=1)).timestamp())
+    assert d["spans"] == [{"account_id": "a", "first": a0, "last": a0 + 1200}, {"account_id": "b", "first": b0, "last": b0}]
 
     d = client.get("/api/history?kinds=weekly_all&accounts=a").json()
     assert [s["kind"] for s in d["series"]] == ["weekly_all"]
@@ -297,6 +301,34 @@ def test_history_since_until(env):
     d = client.get(f"/api/history?since={since}&until={until2}").json()
     assert d["gaps"] == [{"account_id": "a", "from": int((t0 + timedelta(minutes=20)).timestamp()),
                           "to": int((t0 + timedelta(hours=3)).timestamp())}]
+    # until より後の取得は読まない（gaps・errors・spans のどれにも出ない）
+    save(svc.store, reading("b", t0 + timedelta(hours=5), status=Status.LOGGED_OUT))
+    d = client.get(f"/api/history?since={since}&until={until2}").json()
+    assert all(x["t"] <= until2 for x in d["errors"])
+    assert {s["account_id"]: (s["first"], s["last"]) for s in d["spans"]} == {
+        "a": (int(t0.timestamp()), int((t0 + timedelta(hours=3)).timestamp())),
+        "b": (int((t0 + timedelta(minutes=5)).timestamp()),) * 2,
+    }
+
+
+def test_history_until_skips_later_rows(env, monkeypatch):
+    # 過去の範囲を見るときは、until より後の取得を DB から読まない
+    client, svc, *_ = env
+    seen = {}
+    orig = svc.store.snapshot_times
+
+    def spy(since, account_ids=None, until=None):
+        seen["until"] = until
+        return orig(since, account_ids, until=until)
+
+    monkeypatch.setattr(svc.store, "snapshot_times", spy)
+    end = int((NOW - timedelta(days=3)).timestamp())
+    client.get(f"/api/history?since={end - 3600}&until={end}")
+    assert seen["until"] is not None and int(seen["until"].timestamp()) == end
+
+
+def test_history_since_until_limits(env):
+    client, *_ = env
     # ちょうど120日は通り、超えれば422。since >= until・片方だけ・範囲外の値も422
     end = int(NOW.timestamp())
     assert client.get(f"/api/history?since={end - 120 * 86400}&until={end}").status_code == 200

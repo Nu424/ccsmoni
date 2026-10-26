@@ -15,6 +15,22 @@ const newKey = () => `k${++keySeq}`;
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const HEX = /^#[0-9a-f]{6}$/i;
 
+// サーバーの自動の割り当て（config.resolve_colors、API.md「色の割り当て」）と同じ規則で、フォームの内容から番号を決める。
+// 戻り値: _key → 番号（独自の色なら null）。保存前の並べ替え・追加でも、推移画面で何色になるかをそのまま見せるため。
+export function resolveSlots(accounts, n = 7) {
+  const taken = new Set(accounts.filter((a) => Number.isInteger(a.color)).map((a) => a.color));
+  const out = new Map();
+  accounts.forEach((a, i) => {
+    if (Number.isInteger(a.color)) { out.set(a._key, a.color); return; }
+    if (typeof a.color === "string" && a.color !== "") { out.set(a._key, null); return; }
+    let slot = i % n;
+    for (let k = 0; k < n; k++) { const c = (i + k) % n; if (!taken.has(c)) { slot = c; break; } }
+    taken.add(slot);
+    out.set(a._key, slot);
+  });
+  return out;
+}
+
 // 保存用に、画面だけの印（_key）を外す
 function strip(form) {
   const c = clone(form);
@@ -26,8 +42,6 @@ export function createSettings(ctx) {
   const st = {
     loading: false, loadError: null,
     hash: null, path: null, fileError: null, candidates: [],
-    // 色はサーバーが決める（推移画面の色と一致させるため）。slots: id → {color_slot, color}（保存済みの設定で解決したもの）
-    slots: {}, savedColors: {},
     historyIds: new Set(),    // 履歴があるアカウントの id（新しい id が重なったら注意を出す）
     readonly: null,           // claude_path / host / port（画面では変えられない。設定ファイルで編集する）
     knownHashes: new Set(),   // この画面で読み込んだ・保存した hash（state の config_hash がこれ以外なら外部の変更）
@@ -61,8 +75,6 @@ export function createSettings(ctx) {
       st.candidates = r.candidates || [];
       // 以下は新しいサーバーだけが返す。無ければ空として扱う
       setPalette(r.palette);
-      st.slots = r.slots && typeof r.slots === "object" ? r.slots : {};
-      st.savedColors = Object.fromEntries((r.config.accounts || []).map((a) => [a.id, a.color ?? null]));
       st.historyIds = new Set(Array.isArray(r.history_ids) ? r.history_ids : []);
       st.readonly = r.readonly && typeof r.readonly === "object" ? r.readonly : null;
       st.form = clone(r.config);
@@ -327,13 +339,12 @@ export function createSettings(ctx) {
   }
 
   // 行の色（いまのテーマでの hex）。色の指定: null＝自動、0〜6＝パレットの番号、"#rrggbb"＝独自の色
-  // 自動のときは、保存済みの設定でも自動だったならサーバーが決めた番号（推移画面と同じ）、そうでなければ並び順で仮に決める。
-  function rowColor(a, i) {
+  // 自動のときは、サーバーと同じ規則でフォームの内容から決める（保存済みなら推移画面と同じ番号になる）。
+  function rowColor(a) {
     if (typeof a.color === "string" && HEX.test(a.color)) return a.color;
     if (Number.isInteger(a.color)) return colorOf({ color_slot: a.color });
-    const saved = a.id && st.slots[a.id];
-    if (saved && st.savedColors[a.id] == null) return colorOf(saved);
-    return colorOf({ color_slot: i });
+    const slot = resolveSlots(st.form.accounts, themePalette().length).get(a._key);
+    return colorOf({ color_slot: slot ?? 0 });
   }
 
   function accountRow(a, i, f) {
@@ -341,7 +352,7 @@ export function createSettings(ctx) {
     const open = st.open === k;
     const isNew = st.newKeys.has(k);
     const auto = a.color == null || a.color === "";
-    const color = rowColor(a, i);
+    const color = rowColor(a);
     const nameEl = h("span.acct-name", a.label || "（名前なし）");
     const rowErr = [...st.errors.keys()].some((x) => x.startsWith(`acct:${k}:`));
 
@@ -414,7 +425,7 @@ export function createSettings(ctx) {
     const head = () => root.querySelector(`.acct-row[data-key="${k}"]`);
     const colorField = colorPicker(a, i, ek("color"), () => {
       const sw = head() && head().querySelector(".acct-head .sw");
-      if (sw) { sw.style.background = rowColor(a, i); sw.classList.toggle("is-auto", a.color == null); }
+      if (sw) { sw.style.background = rowColor(a); sw.classList.toggle("is-auto", a.color == null); }
     });
     const test = st.tests.get(k);
 
@@ -462,9 +473,22 @@ export function createSettings(ctx) {
     ]);
   }
 
-  // 色の選択: 自動｜パレット7色（いまのテーマの色で表示）｜独自の色
+  // 色の選択: 自動（いま何色になるかも見せる）｜パレット7色（ほかのアカウントが使っている色に印）｜独自の色
   function colorPicker(a, i, errKey, onPaint) {
     const pal = themePalette();
+    const accs = st.form.accounts;
+    // ほかのアカウントが使っている番号（自動で決まるものも含む）→ 名前
+    const slots = resolveSlots(accs, pal.length);
+    const usedBy = new Map();
+    for (const x of accs) {
+      if (x === a) continue;
+      const n = slots.get(x._key);
+      if (n == null) continue;
+      if (!usedBy.has(n)) usedBy.set(n, []);
+      usedBy.get(n).push(x.label || x.id || "（名前なし）");
+    }
+    // 「自動」にしたら何番になるか
+    const autoSlot = resolveSlots(accs.map((x) => (x === a ? { ...x, color: null } : x)), pal.length).get(a._key);
     const wrap = h("div.color-choice", { role: "radiogroup", "aria-label": "色" });
     const custom = typeof a.color === "string" && HEX.test(a.color) ? a.color : null;
     const hexInput = h("input.mono.hex", { type: "text", spellcheck: "false", placeholder: "#rrggbb", value: custom || "", "aria-label": "独自の色（#rrggbb）",
@@ -474,7 +498,7 @@ export function createSettings(ctx) {
         else if (v === "") { a.color = null; paint(); }
         else { a.color = v; changed(errKey); }
       } });
-    const picker = h("input.color-picker", { type: "color", value: custom || rowColor(a, i), "aria-label": "独自の色を選ぶ", tabindex: "-1",
+    const picker = h("input.color-picker", { type: "color", value: custom || rowColor(a), "aria-label": "独自の色を選ぶ", tabindex: "-1",
       oninput: (e) => { a.color = e.target.value; hexInput.value = a.color; paint(); } });
     const opt = (sel, label, attrs, kids) => h("button.cc", { type: "button", role: "radio", "aria-checked": String(sel), title: label, "aria-label": label, ...attrs }, kids);
     const paint = () => {
@@ -487,8 +511,15 @@ export function createSettings(ctx) {
       onPaint(); changed(errKey);
     };
     setChildren(wrap,
-      opt(a.color == null, "自動（並び順で決める）", { dataset: { v: "auto" }, onclick: () => { a.color = null; hexInput.value = ""; paint(); } }, h("span.cc-auto", "自動")),
-      pal.map((c, n) => opt(a.color === n, `パレットの ${n + 1} 番`, { dataset: { v: String(n) }, style: { "--sw": c }, onclick: () => { a.color = n; hexInput.value = ""; paint(); } }, h("span.cc-sw"))),
+      opt(a.color == null, `自動（並び順で決める。いまは ${autoSlot + 1} 番の色）`, { dataset: { v: "auto" }, onclick: () => { a.color = null; hexInput.value = ""; paint(); } },
+        [h("span.cc-auto", "自動"), h("span.cc-sw.cc-mini", { style: { "--sw": pal[autoSlot] }, "aria-hidden": "true" })]),
+      pal.map((c, n) => {
+        const users = usedBy.get(n);
+        const label = `パレットの ${n + 1} 番${users ? `（${users.map((x) => `「${x}」`).join("")}が使用中）` : ""}`;
+        return opt(a.color === n, label, { dataset: { v: String(n) }, style: { "--sw": c }, class: users ? "is-used" : "",
+          onclick: () => { a.color = n; hexInput.value = ""; paint(); } },
+        [h("span.cc-sw"), users ? h("span.cc-used", { "aria-hidden": "true" }, users.length > 1 ? String(users.length) : "") : null]);
+      }),
       h("span.cc-custom", [opt(typeof a.color === "string", "独自の色", { dataset: { v: "custom" }, onclick: () => {
         if (typeof a.color !== "string") { a.color = picker.value; hexInput.value = a.color; paint(); }
         picker.click();
@@ -525,15 +556,18 @@ export function createSettings(ctx) {
 
   function addAccount(cand) {
     const f = st.form;
-    // 使われている番号（自動で決まった番号も含む）と重ならない、パレットの最初の番号。全部使われていれば自動に任せる
-    const used = new Set(f.accounts.map((a) => (Number.isInteger(a.color) ? a.color : a.color == null && st.slots[a.id] ? st.slots[a.id].color_slot : null)));
-    const free = themePalette().findIndex((_, n) => !used.has(n));
+    // 未使用の色番号を明示して保存する（自動の割り当ては並び順で決まるので、あとで別のアカウントを消したときに、
+    // ほかのアカウントの色まで変わってしまうため）。全部使われていれば、使っている数がいちばん少ない番号
+    const n = themePalette().length;
+    const count = new Array(n).fill(0);
+    for (const slot of resolveSlots(f.accounts, n).values()) if (slot != null) count[slot]++;
+    const free = count.indexOf(Math.min(...count));
     const a = {
       id: cand ? uniqueId(cand.suggested_id) : "",
       label: cand ? cand.suggested_id : "",
       config_dir: cand ? cand.config_dir : "",
       launch_command: null,
-      color: free >= 0 ? free : null,
+      color: free,
       interval_minutes: null,
       enabled: true,
       _key: newKey(),

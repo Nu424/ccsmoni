@@ -149,6 +149,12 @@ def test_snapshot_times(store):
         ("a", int((T0 + timedelta(minutes=10)).timestamp()), "error"),
     ]
     assert len(store.snapshot_times(T0)) == 3
+    # until（含む）で後ろを絞る
+    assert store.snapshot_times(T0, until=T0 + timedelta(minutes=5)) == [
+        ("a", int(T0.timestamp()), "ok"),
+        ("b", int((T0 + timedelta(minutes=5)).timestamp()), "ok"),
+    ]
+    assert store.snapshot_times(T0, ["a"], until=T0 - timedelta(seconds=1)) == []
 
 
 def test_account_meta(store):

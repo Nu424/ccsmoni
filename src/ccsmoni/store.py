@@ -370,11 +370,17 @@ class Store:
         ]
 
     def snapshot_times(
-        self, since: datetime, account_ids: list[str] | None = None
+        self, since: datetime, account_ids: list[str] | None = None, until: datetime | None = None
     ) -> list[tuple[str, int, str]]:
-        """取得の記録 (account_id, epoch秒, status)。抜けやエラーをグラフに出すため。"""
+        """取得の記録 (account_id, epoch秒, status)。抜けやエラーをグラフに出すため。
+
+        until を渡すと、その時刻まで（含む）に絞る（過去の範囲を見るときに、それより後の行を読まないため）。
+        """
         params: list[Any] = [_to_epoch(since)]
         sql = "SELECT account_id, taken_at, status FROM snapshots WHERE taken_at >= ?"
+        if until is not None:
+            sql += " AND taken_at <= ?"
+            params.append(_to_epoch(until))
         sql += _in_clause("account_id", account_ids, params)
         sql += " ORDER BY taken_at, id"
         with self._lock:

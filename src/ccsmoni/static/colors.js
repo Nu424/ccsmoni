@@ -11,8 +11,11 @@ const FALLBACK = {
 };
 let palette = FALLBACK;
 
+// hex でない値が混じっていたら、その面は控えのまま使う（canvas に不正な色を渡すと黒になり、気づきにくい）
 export function setPalette(p) {
-  if (p && Array.isArray(p.light) && Array.isArray(p.dark) && p.light.length && p.dark.length) palette = p;
+  const ok = (a) => Array.isArray(a) && a.length > 0 && a.every((c) => typeof c === "string" && HEX.test(c));
+  if (!p) return;
+  palette = { light: ok(p.light) ? p.light : FALLBACK.light, dark: ok(p.dark) ? p.dark : FALLBACK.dark };
 }
 export function isDark() {
   const t = document.documentElement.dataset.theme;
@@ -33,3 +36,19 @@ export function rgba(hex, a) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 export const isHex = (s) => typeof s === "string" && HEX.test(s);
+
+// 色の重なり（7件を超えると同じ色が出る）: list の並びで、先に同じ色を使っているアカウントがあれば 1 以上
+// 戻り値: id → 何番目の重なりか（0 = 重なりなし）。重ねる表示の破線・タイルの色見本の模様に使う
+export function dupIndex(list) {
+  const seen = new Map(), out = new Map();
+  for (const a of list) {
+    const c = colorOf(a).toLowerCase();
+    const n = seen.get(c) || 0;
+    out.set(a.id, n);
+    seen.set(c, n + 1);
+  }
+  return out;
+}
+// 重なりの段 → 破線の模様
+export const DASHES = [[], [6, 4], [2, 3], [10, 3, 2, 3]];
+export const dashFor = (n) => DASHES[n % DASHES.length];
