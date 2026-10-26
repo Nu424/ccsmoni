@@ -7,7 +7,7 @@
 //       画面は mount / unmount / onState を持つ小さなオブジェクト。
 
 import { api } from "./api.js";
-import { h, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref } from "./ui.js";
+import { h, setChildren, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref } from "./ui.js";
 import { createDashboard } from "./dashboard.js";
 import { createSettings } from "./settings.js";
 
@@ -139,7 +139,7 @@ function renderHeader() {
   const busy = store.refreshPending || (s && s.collector.busy.length > 0);
   refreshBtn.disabled = !!busy;
   refreshBtn.classList.toggle("is-busy", !!busy);
-  refreshBtn.querySelector(".btn-icon").replaceChildren(busy ? spinner() : refreshIcon());
+  setChildren(refreshBtn.querySelector(".btn-icon"), busy ? spinner() : refreshIcon());
   refreshBtn.querySelector(".btn-label").textContent = busy ? "更新中…" : "今すぐ更新";
   if (!s) { runInfo.replaceChildren(); return; }
   const now = ctx.now();
@@ -153,7 +153,7 @@ function renderHeader() {
     parts.push(h("span.ri-item.hide-sm", [h("span.ri-k", "次回"), " ",
       h("b.num", { dataset: { in: s.collector.next_run_at } }, fmtIn(s.collector.next_run_at, now))]));
   }
-  runInfo.replaceChildren(...parts);
+  setChildren(runInfo, ...parts);
 }
 function flashRunInfo() {
   runInfo.classList.remove("flash");
@@ -183,7 +183,7 @@ function renderBanner() {
       h("span.banner-detail", ce), " ", h("a", { href: "#/settings" }, "設定を開く"),
     ]));
   }
-  bannerEl.replaceChildren(...items);
+  setChildren(bannerEl, ...items);
 }
 
 // ---- 毎秒の時刻表示 --------------------------------------------------------------

@@ -8,12 +8,18 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WORDS_FILE = ROOT / "local" / "secret-words.txt"
+
+
+def compile_word(w: str) -> re.Pattern[str]:
+    # 英数字の前後が英数字に続いていないときだけ一致させる（"countLabel" の中の語に誤反応しないため）
+    return re.compile(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", re.IGNORECASE)
 
 
 def load_words() -> list[str]:
@@ -57,19 +63,18 @@ def main() -> int:
     if not words:
         return 0
 
+    patterns = [compile_word(w) for w in words]
     hits: list[str] = []
     for path in target_files(check_all):
         # ファイル名自体もチェック対象
-        lowered_path = path.lower()
-        for w in words:
-            if w in lowered_path:
-                hits.append(f"{path}: (ファイル名) 禁止語 #{words.index(w) + 1}")
+        for i, pat in enumerate(patterns, 1):
+            if pat.search(path):
+                hits.append(f"{path}: (ファイル名) 禁止語 #{i}")
         for lineno, line in enumerate(read_content(path, check_all).splitlines(), 1):
-            lowered = line.lower()
-            for w in words:
-                if w in lowered:
-                    # 禁止語そのものは表示しない（ログに残さないため）。リストの行番号で示す
-                    hits.append(f"{path}:{lineno}: 禁止語 #{words.index(w) + 1}")
+            for i, pat in enumerate(patterns, 1):
+                if pat.search(line):
+                    # 禁止語そのものは表示しない（ログに残さないため）。リストでの番号で示す
+                    hits.append(f"{path}:{lineno}: 禁止語 #{i}")
 
     if hits:
         print("[check_secrets] 機密情報の可能性がある記述が見つかりました。コミットを中止します。", file=sys.stderr)

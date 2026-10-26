@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reparse", help="保存済みの raw をパーサーで読み直し、DB の解釈結果を作り直す")
     demo = sub.add_parser("demo", help="架空の 4 アカウントの設定と 30 日分の合成履歴を作る（UI の確認用）")
     demo.add_argument("--home", required=True, help="作成先のディレクトリ（serve するときは CCSMONI_HOME にこれを指定）")
-    demo.add_argument("--days", type=int, default=30, help="履歴の日数（既定 30）")
+    demo.add_argument("--days", type=float, default=30, help="履歴の日数（既定 30。小数も可: 0.05 ≒ 1 時間。記録を始めたばかりの画面の確認用）")
     demo.add_argument("--force", action="store_true", help="既存のデモを作り直す")
     return p
 

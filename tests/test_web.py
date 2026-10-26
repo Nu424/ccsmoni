@@ -148,8 +148,8 @@ def env(tmp_path: Path):
 def test_state_shape(env):
     client, svc, *_ = env
     store = svc.store
-    for i in range(4):
-        save(store, reading("a", NOW - timedelta(minutes=30 - 10 * i), session=10 + 10 * i))
+    for i in range(7):
+        save(store, reading("a", NOW - timedelta(minutes=60 - 10 * i), session=10 + 10 * i))
     save(store, reading("b", NOW - timedelta(hours=2), weekly=20))
     save(store, reading("b", NOW - timedelta(hours=1), status=Status.LOGGED_OUT))
 
@@ -167,10 +167,11 @@ def test_state_shape(env):
     assert a["interval_minutes"] == 10 and a["stale"] is False and a["last_ok"] is None
     assert [lim["kind"] for lim in a["limits"]] == ["session", "weekly_all"]
     sess = a["limits"][0]
-    assert sess["percent"] == 40 and sess["resets_at"] == int((NOW + timedelta(hours=2)).timestamp())
+    assert sess["percent"] == 70 and sess["resets_at"] == int((NOW + timedelta(hours=2)).timestamp())
     assert sess["pace"]["elapsed_ratio"] == 0.6
-    # 直近 30 分で 10%→40%（1%/分）→ あと 60 分で上限。リセット（2 時間後）より前
-    assert sess["pace"]["eta_full"] == int((NOW + timedelta(minutes=60)).timestamp())
+    # 直近 1 時間で 10%→70%（1%/分）→ あと 30 分で上限。リセット（2 時間後）より前
+    # （5h 枠は直近 1 時間分の履歴がそろったときだけ直近の速度を使う。平均速度なら約 77 分後）
+    assert sess["pace"]["eta_full"] == int((NOW + timedelta(minutes=30)).timestamp())
     assert a["hints"][0]["kind"] == "will_hit_limit"
 
     assert b["status"] == "logged_out" and b["limits"] == [] and b["hints"] == []

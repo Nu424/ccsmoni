@@ -52,17 +52,54 @@ def test_eta_from_window_average_when_few_points():
     assert p["eta_full"] == NOW + 2 * DAY
 
 
-def test_eta_uses_recent_rate():
-    # 直近 4 時間で 40% → 60%（5%/h）。残り 40% は 8 時間後。平均速度（2日で60%）より速い
-    pts = [(NOW - 4 * H + i * H, 40 + 5 * i) for i in range(5)]
+def test_eta_uses_recent_rate_when_24h_of_history():
+    # 直近 24 時間で 36% → 60%（1%/h）。残り 40% は 40 時間後。平均速度（2日で60% → 残り 40% は 32 時間）より遅い
+    pts = [(NOW - 24 * H + i * H, 36 + i) for i in range(25)]
     p = pace(lim("weekly_all", 60, resets_in=5 * DAY), NOW, pts)
-    assert p["eta_full"] == NOW + 8 * H
+    assert p["eta_full"] == NOW + 40 * H
+
+
+def test_eta_short_burst_does_not_extrapolate():
+    # 回帰: 週間 65%・リセットまで 5 日。直近 1 時間だけ 5%/h で増えた。
+    # 以前は 1 時間の勢いを延ばして「7 時間後に上限」と出ていた。24 時間分の履歴が無いので平均速度を使う。
+    burst = [(NOW - H + i * 600, 60 + 5 * i / 6) for i in range(7)]
+    p = pace(lim("weekly_all", 65, resets_in=5 * DAY), NOW, burst)
+    # 開始から 2 日で 65% → 32.5%/日 → 残り 35% は約 25.8 時間後
+    assert p["eta_full"] == NOW + round(35 / (65 / (2 * DAY)))
+    assert p["eta_full"] > NOW + DAY
+    # 4 時間分でも同じ（週間枠は 24 時間分そろうまで直近の速度を使わない）
+    four = [(NOW - 4 * H + i * H, 45 + 5 * i) for i in range(5)]
+    assert pace(lim("weekly_all", 65, resets_in=5 * DAY), NOW, four)["eta_full"] == p["eta_full"]
+
+
+def test_eta_none_right_after_window_start():
+    # 週間枠が始まって 6 時間で 10%（平均なら 2.5 日で上限）でも、12 時間たつまでは予測しない
+    assert pace(lim("weekly_all", 10, resets_in=7 * DAY - 6 * H), NOW)["eta_full"] is None
+    assert pace(lim("weekly_all", 10, resets_in=7 * DAY - 13 * H), NOW)["eta_full"] is not None
+    # 5h 枠は 30 分
+    assert pace(lim("session", 30, resets_in=5 * H - 20 * 60), NOW)["eta_full"] is None
+    # すでに上限なら出す
+    assert pace(lim("session", 100, resets_in=5 * H - 5 * 60), NOW)["eta_full"] == NOW
+
+
+def test_eta_session_recent_needs_one_hour():
+    # 5h 枠: 開始 3 時間で 30%（平均 10%/h → 7 時間後でリセットより後）。直近 1 時間分の点がそろえば、その傾きを使う
+    pts = [(NOW - H + i * 600, 10 + 20 * i / 6) for i in range(7)]  # 20%/h → 3.5 時間後。まだリセットより後
+    p = pace(lim("session", 30, resets_in=2 * H), NOW, pts)
+    assert p["eta_full"] is None
+    # 30 分ぶんしか無ければ、速くても平均速度のまま
+    half = [(NOW - 30 * 60 + i * 600, 0 + 10 * i) for i in range(4)]  # 60%/h
+    assert pace(lim("session", 30, resets_in=2 * H), NOW, half)["eta_full"] is None
+    pts2 = [(NOW - H + i * 600, -30 + 60 * i / 6) for i in range(7)]  # 60%/h
+    p2 = pace(lim("session", 30, resets_in=2 * H), NOW, pts2)
+    assert p2["eta_full"] == NOW + 70 * 60  # 残り 70% を 60%/h
 
 
 def test_eta_none_when_recent_rate_flat_or_after_reset():
-    flat = [(NOW - 4 * H + i * H, 60) for i in range(5)]
+    # 直近 24 時間まったく増えていない → 予測しない（平均速度なら 2 日で 60% なので出てしまう）
+    flat = [(NOW - 24 * H + i * H, 60) for i in range(25)]
     assert pace(lim("weekly_all", 60, resets_in=5 * DAY), NOW, flat)["eta_full"] is None
-    slow = [(NOW - 4 * H + i * H, 60 + 0.1 * i) for i in range(5)]
+    slow = [(NOW - 24 * H + i * H, 58 + 0.1 * i) for i in range(25)]
     assert pace(lim("weekly_all", 60.4, resets_in=DAY), NOW, slow)["eta_full"] is None
 
 

@@ -301,7 +301,7 @@ DEMO_CANDIDATES = [{"suggested_id": "acct-e", "config_dir": "~/claude-demo/acct-
 # ---------------------------------------------------------------- ccsmoni demo --home
 
 
-def create_demo_home(home: Path, days: int = 30, force: bool = False, now: float | None = None) -> dict[str, int]:
+def create_demo_home(home: Path, days: float = 30, force: bool = False, now: float | None = None) -> dict[str, int]:
     """home に架空の設定と合成履歴の DB を作る。戻り値は件数の要約。"""
     from ccsmoni.config import AccountConfig, ConfigService
     from ccsmoni.parser_usage import UsageTextParser

@@ -6,7 +6,7 @@
 //       表示／非表示と強調は作り直さずに切り替える。
 
 import { api } from "./api.js";
-import { h, bar, statusChip, chip, segmented, spinner, toast, copyCmd, fmtPct, fmtAgo, fmtCountdown, fmtDate,
+import { h, setChildren, bar, statusChip, chip, segmented, spinner, toast, copyCmd, fmtPct, fmtAgo, fmtCountdown, fmtDate,
   fmtDateTime, loadPref, savePref, readableColor, cssVar, level } from "./ui.js";
 import { overlayChart, multiplesChart } from "./chart.js";
 
@@ -28,7 +28,7 @@ export function createDashboard(ctx) {
     loginBusy: new Set(), // ［ログイン］を押して、サーバーの login が見えるまで
   };
   let server = null;
-  let root, cardsEl, noticeEl, chartHost, legendEl, ctrlEl, peaksEl, chartNote;
+  let root, cardsEl, noticeEl, chartHost, legendEl, ctrlEl, peaksEl, chartNote, chartInfo;
   let chart = null;
   let lastRunSeen = null;
 
@@ -39,6 +39,7 @@ export function createDashboard(ctx) {
     ctrlEl = h("div.panel-ctrl");
     legendEl = h("div.legend", { role: "group", "aria-label": "表示するアカウント" });
     chartHost = h("div.chart-host");
+    chartInfo = h("p.chart-info", { hidden: true });
     chartNote = h("div.chart-note");
     peaksEl = h("section.panel.peaks", { "aria-label": "週ごとのピーク" });
     root = h("div.dash", [
@@ -47,6 +48,7 @@ export function createDashboard(ctx) {
       h("section.panel.chart-panel", [
         h("div.panel-head", [h("h2", "推移"), ctrlEl]),
         legendEl,
+        chartInfo,
         chartHost,
         chartNote,
       ]),
@@ -123,7 +125,7 @@ export function createDashboard(ctx) {
       }, dash.showDisabled ? `無効なアカウントを隠す` : `無効なアカウント ${disabled.length}件`));
       if (dash.showDisabled) list.push(...disabled.map((a) => card(a, now, busy)));
     }
-    cardsEl.replaceChildren(...list);
+    setChildren(cardsEl, ...list);
   }
 
   function card(a, now, busy) {
@@ -193,7 +195,9 @@ export function createDashboard(ctx) {
       h("span.meter-name", name),
       pct == null ? h("span.meter-empty", emptyText || "—") : bar(pct, { ui, expected, faded }),
       h("span.meter-pct.num", { class: `lv-text-${lv}` }, pct == null ? "" : fmtPct(pct)),
-      h("span.meter-reset.num", resetsAt ? { dataset: { until: resetsAt }, title: `リセット ${fmtDateTime(resetsAt)}` } : {},
+      // 過ぎていたら is-past（毎秒の tick() と同じ判定を、最初の描画でもしておく。折り返しの CSS が効くように）
+      h("span.meter-reset.num", resetsAt ? { dataset: { until: resetsAt }, title: `リセット ${fmtDateTime(resetsAt)}`,
+        class: fmtCountdown(resetsAt, ctx.now()) ? "" : "is-past" } : {},
         resetsAt ? (fmtCountdown(resetsAt, ctx.now()) || "リセット済み（推定）") : resetText),
     ]);
   }
@@ -266,7 +270,7 @@ export function createDashboard(ctx) {
   function renderNotice() {
     const cands = (server.candidates || []).filter((c) => !dash.dismissed.has(c.config_dir));
     if (!cands.length) { noticeEl.replaceChildren(); return; }
-    noticeEl.replaceChildren(h("div.notice", [
+    setChildren(noticeEl, h("div.notice", [
       h("span.notice-dot", { "aria-hidden": "true" }),
       h("span", [`新しいアカウントが見つかりました（${cands.map((c) => c.suggested_id).join("、")}）`]),
       h("a.btn.btn-ghost.btn-sm", { href: "#/settings" }, "設定で追加 →"),
@@ -280,7 +284,7 @@ export function createDashboard(ctx) {
 
   // ---- グラフの操作部 ------------------------------------------------------------------
   function renderControls() {
-    ctrlEl.replaceChildren(
+    setChildren(ctrlEl,
       segmented(KIND_OPTS, dash.mode === "multi" ? null : dash.kind, (v) => {
         dash.kind = v; savePref("chart.kind", v);
         if (dash.mode === "multi") { dash.mode = "overlay"; savePref("chart.mode", "overlay"); }
@@ -295,10 +299,12 @@ export function createDashboard(ctx) {
     );
   }
 
+  // 推移画面（凡例・グラフ・ピーク表）に出すアカウント。有効なものだけ。
+  // 無効にしたアカウントは「いまは見ない」という意思表示なので、履歴が残っていても出さない
+  // （カードの帯の「無効なアカウント n件」から現在値は見られる）。
   function chartAccounts() {
     if (!server) return [];
-    const has = new Set((dash.history ? dash.history.series : []).filter((s) => s.segments.some((g) => g.points.length)).map((s) => s.account_id));
-    return server.accounts.filter((a) => a.enabled || has.has(a.id));
+    return server.accounts.filter((a) => a.enabled);
   }
 
   // 凡例: 押す → 表示／非表示。ダブルクリック（スマホは長押し）→ それだけ表示。もう一度で全部表示。
@@ -334,7 +340,7 @@ export function createDashboard(ctx) {
       }, [h("span.sw", { style: { background: readableColor(a.color, bg) } }), h("span", a.label)]);
     });
     const allHidden = accts.length && accts.every((a) => dash.hidden.has(a.id));
-    legendEl.replaceChildren(...items,
+    setChildren(legendEl, ...items,
       dash.hidden.size && accts.some((a) => dash.hidden.has(a.id))
         ? h("button.legend-reset", { type: "button", onclick: () => { dash.hidden.clear(); applyHidden(); } }, "全部表示")
         : h("span.legend-help.hide-sm", "押すと表示／非表示・ダブルクリックでそれだけ表示"),
@@ -356,7 +362,7 @@ export function createDashboard(ctx) {
 
   // ---- グラフ本体 --------------------------------------------------------------------
   function renderChartLoading() {
-    if (!chart) chartHost.replaceChildren(h("div.chart-empty", [spinner(), " 読み込み中…"]));
+    if (!chart) setChildren(chartHost, h("div.chart-empty", [spinner(), " 読み込み中…"]));
     else chartHost.classList.add("is-loading");
   }
   function renderChart() {
@@ -375,23 +381,72 @@ export function createDashboard(ctx) {
       return;
     }
     const accounts = chartAccounts().map((a) => ({ id: a.id, label: a.label, color: a.color }));
-    if (dash.mode === "multi") {
-      chart = multiplesChart({ el: chartHost, history: dash.history, accounts, range: dash.range, focus: dash.focus });
+    const ext = dataExtent(accounts);
+    renderChartInfo(ext);
+    if (ext.sparse) {
+      // 数点しかないと線にならず、空のグラフに見えるだけなので、グラフは作らずに理由を出す
+      chartHost.append(h("div.chart-empty", { class: "is-sparse" }, [
+        h("b", "データがたまると推移が描かれます"),
+        h("span", `記録開始: ${fmtDateTime(ext.first)}。${countLabel(ext.perAccount)}`),
+      ]));
+    } else if (dash.mode === "multi") {
+      chart = multiplesChart({ el: chartHost, history: dash.history, accounts, focus: dash.focus, xMin: ext.xMin });
     } else {
       chart = overlayChart({ el: chartHost, history: dash.history, kind: dash.kind, accounts, hidden: dash.hidden,
-        focus: dash.focus, range: dash.range });
+        focus: dash.focus, xMin: ext.xMin });
       if (!chart.hasData) chartHost.append(h("div.chart-empty.on-top", "この期間のデータはまだありません"));
       chartHost.append(h("div.chart-allhidden", ["すべて非表示になっています ",
         h("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => { dash.hidden.clear(); applyHidden(); } }, "全部表示")]));
     }
     renderLegend();
-    chartNote.replaceChildren(...[
+    // グラフを描かないときは、印の説明も出さない
+    setChildren(chartNote, ext.sparse ? null : [
       dash.mode === "multi" ? h("span.note-item", [h("i.mk-line"), "週間"]) : null,
       dash.mode === "multi" ? h("span.note-item", [h("i.mk-area"), "5h"]) : null,
       h("span.note-item", [h("i.mk-reset"), "リセット"]),
       h("span.note-item", [h("i.mk-gap"), "取得できなかった区間"]),
-      h("span.note-item", [h("i.mk-err"), "エラー（ログイン切れなど）"]),
-    ].filter(Boolean));
+      h("span.note-item", [h("i.mk-err"), h("i.mk-errband"), "エラー（ログイン切れなど。続いたものは帯）"]),
+    ]);
+  }
+
+  // ---- データが選んだ期間より短いとき ----------------------------------------------------------
+  // 記録を始めたばかりだと、7日の範囲の右端に点が少しあるだけで、グラフがほぼ空に見える。
+  // そこで x 軸の左端を「最初のデータの少し前」に詰め、グラフの上に「記録開始: … から」と注記する
+  // （期間を切り替えても形が変わらない理由が、注記でわかるように）。数点しかないときはグラフを描かない。
+  // 「まだ描けない」とみなす目安: アカウントごとの値がこれ未満、または記録が始まってからこれだけたっていない
+  // （10 分おきの取得なら 30 分 ≒ 4 点。それより短いと、線というより点の集まりにしかならない）
+  const SPARSE_POINTS = 3;
+  const SPARSE_SPAN = 30 * 60;
+  function dataExtent(accounts) {
+    const hist = dash.history;
+    const ids = new Set(accounts.map((a) => a.id));
+    let first = Infinity;
+    const perAcct = new Map();
+    for (const s of hist.series) {
+      if (!ids.has(s.account_id)) continue;
+      const set = perAcct.get(s.account_id) || new Set();
+      perAcct.set(s.account_id, set);
+      for (const g of s.segments) for (const [t] of g.points) { set.add(t); if (t < first) first = t; }
+    }
+    for (const e of hist.errors) if (ids.has(e.account_id) && e.t < first) first = e.t;
+    const perAccount = Math.max(0, ...[...perAcct.values()].map((x) => x.size));
+    if (!Number.isFinite(first)) return { first: null, xMin: hist.since, trimmed: false, sparse: false, perAccount };
+    const span = hist.until - hist.since;
+    // 範囲の始まりから 2% 以上あとにしかデータが無いときだけ詰める（ほぼそろっているなら、選んだ期間のまま）
+    const trimmed = first > hist.since + span * 0.02;
+    const pad = Math.max(600, (hist.until - first) * 0.04);
+    return { first, trimmed, perAccount, xMin: trimmed ? Math.max(hist.since, first - pad) : hist.since,
+      sparse: perAccount < SPARSE_POINTS || hist.until - first < SPARSE_SPAN };
+  }
+  function countLabel(n) {
+    return n ? `いま ${n} 回分の記録があります。` : "まだ値を取得できていません。";
+  }
+  function renderChartInfo(ext) {
+    if (!ext.trimmed || ext.sparse) { setChildren(chartInfo); chartInfo.hidden = true; return; }
+    chartInfo.hidden = false;
+    const label = (RANGE_OPTS.find((o) => o.value === dash.range) || {}).label || dash.range;
+    setChildren(chartInfo, h("span.chart-info-k", `記録開始: ${fmtDateTime(ext.first)} から`),
+      h("span.muted", `（${label}分たまるまでは、記録のある範囲だけを表示しています）`));
   }
 
   // ---- 週ごとのピーク表 ------------------------------------------------------------------
@@ -399,8 +454,9 @@ export function createDashboard(ctx) {
   function renderPeaks() {
     if (!peaksEl || !dash.windows || !server) return;
     const now = ctx.now();
-    const order = server.accounts.map((a) => a.id);
-    const rows = [...dash.windows.rows].filter((r) => r.windows.length)
+    // グラフと同じく有効なアカウントだけ（設定から消したアカウントの履歴も出さない）
+    const order = chartAccounts().map((a) => a.id);
+    const rows = [...dash.windows.rows].filter((r) => r.windows.length && order.includes(r.account_id))
       .sort((x, y) => order.indexOf(x.account_id) - order.indexOf(y.account_id));
     const cols = Math.min(8, Math.max(0, ...rows.map((r) => r.windows.length)));
     const bg = cssVar("--surface") || "#fff";
@@ -424,9 +480,11 @@ export function createDashboard(ctx) {
         }),
       ]);
     });
-    peaksEl.replaceChildren(
+    setChildren(peaksEl,
       h("div.panel-head", [h("h2", "週ごとのピーク"), h("span.panel-sub", "各週の最大使用率（週間枠）")]),
-      rows.length ? h("div.peak-wrap", h("table.peak", [h("thead", head), h("tbody", body)]))
+      // 列の数を CSS に渡して、表の幅を「列数 × セルの上限幅」までに抑える（列が少ないときにセルが横いっぱいに伸びないように）
+      rows.length ? h("div.peak-wrap", h("table.peak", { style: { "--cols": String(cols), "--cols-sm": String(Math.min(cols, 5)) } },
+        [h("thead", head), h("tbody", body)]))
         : h("p.muted", "まだ1週間分のデータがありません。"),
     );
   }

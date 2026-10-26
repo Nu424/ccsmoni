@@ -7,7 +7,7 @@
 //   - 行には画面内だけの _key を付ける。新規の id は書き換えられるので、id を行の目印にしない。
 
 import { api } from "./api.js";
-import { h, spinner, toast, statusChip, bar, fmtPct, readableColor, cssVar, copyCmd } from "./ui.js";
+import { h, setChildren, spinner, toast, statusChip, bar, fmtPct, readableColor, cssVar, copyCmd } from "./ui.js";
 
 let keySeq = 0;
 const newKey = () => `k${++keySeq}`;
@@ -143,14 +143,14 @@ export function createSettings(ctx) {
 
   function render() {
     if (!root) return;
-    if (st.loading && !st.form) { root.replaceChildren(h("div.chart-empty", [spinner(), " 読み込み中…"])); return; }
+    if (st.loading && !st.form) { setChildren(root, h("div.chart-empty", [spinner(), " 読み込み中…"])); return; }
     if (st.loadError && !st.form) {
-      root.replaceChildren(h("div.panel", [h("p", ["設定を読み込めませんでした（", st.loadError, "）"]),
+      setChildren(root, h("div.panel", [h("p", ["設定を読み込めませんでした（", st.loadError, "）"]),
         h("button.btn", { type: "button", onclick: load }, "再試行")]));
       return;
     }
     const f = st.form;
-    root.replaceChildren(...[
+    setChildren(root, ...[
       st.fileError ? h("div.banner.tone-warn", ["設定ファイルに誤りがあります: ", st.fileError]) : null,
       st.restartRequired ? h("div.banner.tone-info", "ホスト・ポートの変更は、ccsmoni を再起動すると反映されます。") : null,
       accountsPanel(f),
@@ -193,7 +193,7 @@ export function createSettings(ctx) {
     } else {
       content = [h("span.dot.tone-ok"), h("span", st.justSaved ? "保存しました" : "保存済み")];
     }
-    statusEl.replaceChildren(...content);
+    setChildren(statusEl, ...content);
     saveBtn.disabled = !dirty || st.saving;
     revertBtn.hidden = !dirty;
     root && root.classList.toggle("is-dirty", dirty);
@@ -468,7 +468,7 @@ export function createSettings(ctx) {
     const paintPreview = () => {
       const w = Number(ui.warn_percent), d = Number(ui.danger_percent);
       const okW = Math.max(0, Math.min(100, w)), dW = Math.max(okW, Math.min(100, d));
-      preview.replaceChildren(
+      setChildren(preview, 
         h("span.th-zone.lv-ok", { style: { width: `${okW}%` } }, okW >= 12 ? "通常" : ""),
         h("span.th-zone.lv-warn", { style: { width: `${dW - okW}%` } }, dW - okW >= 10 ? "警告" : ""),
         h("span.th-zone.lv-danger", { style: { width: `${100 - dW}%` } }, 100 - dW >= 8 ? "危険" : ""),

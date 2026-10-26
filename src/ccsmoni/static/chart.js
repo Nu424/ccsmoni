@@ -8,7 +8,7 @@
 //   - 強調（カードを押したとき）と表示／非表示は、作り直さずに series[].show と redraw で切り替える。
 
 import uPlot from "./vendor/uPlot.esm.js";
-import { h, cssVar, readableColor, withAlpha, fmtPct, fmtDateTime, fmtClock, fmtDate } from "./ui.js";
+import { h, setChildren, cssVar, readableColor, withAlpha, fmtPct, fmtDateTime, fmtClock, fmtDate } from "./ui.js";
 
 // ---- データの変換 -----------------------------------------------------------------
 // アカウント1つ・kind 1つ分を [[t, v|null], ...] の列にする（null は線の切れ目）。
@@ -99,29 +99,92 @@ function themeTokens() {
   };
 }
 
-function xAxisValues(rangeKey) {
-  return (u, splits) => splits.map((t) => {
-    if (rangeKey === "24h") return fmtClock(t);
-    const d = new Date(t * 1000);
-    if (rangeKey === "7d" && (d.getHours() !== 0 || d.getMinutes() !== 0)) return fmtClock(t);
-    return fmtDate(t);
-  });
+// x 軸の目盛り。選んだ期間（24h / 7日 / 30日）ではなく、実際に描いている幅から間隔を決める。
+// データが期間より短いときは x 軸の左端を詰める（dashboard.js の dataStart）ので、1 時間しか描かないこともある。
+// 間隔は「画面の幅に対して目盛りが多すぎない、いちばん細かいもの」。結果として
+//   24h → 3 時間ごと（スマホは 6 時間）、7日 → 1 日ごと（2 日）、30日 → 3 日ごと（7 日）になる。
+const STEPS = [600, 1800, 3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400, 3 * 86400, 7 * 86400];
+function pickStep(span, width) {
+  const target = width < 500 ? 5 : 10;
+  return STEPS.find((s) => span / s <= target) || STEPS[STEPS.length - 1];
 }
 
-// 7日なら 1日ごと、30日なら数日ごとに目盛りを置く（日付の境目に合わせる）
-function xSplits(rangeKey) {
+// 1 日より細かい間隔は時刻、日の境目と 1 日以上の間隔は日付
+function xAxisValues() {
+  return (u, splits) => {
+    const step = splits.length > 1 ? splits[1] - splits[0] : 86400;
+    return splits.map((t) => {
+      const d = new Date(t * 1000);
+      return step >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0) ? fmtDate(t) : fmtClock(t);
+    });
+  };
+}
+
+// 目盛りはローカル時刻の切りのよい所（0:00 から間隔ごと）に置く
+function xSplits() {
   return (u, axisIdx, min, max) => {
-    const step = rangeKey === "24h" ? 3 * 3600 : rangeKey === "7d" ? 86400 : (u.width < 600 ? 7 : 3) * 86400;
+    const step = pickStep(max - min, u.width);
     const d = new Date(min * 1000);
-    if (rangeKey === "24h") d.setMinutes(0, 0, 0); else d.setHours(0, 0, 0, 0);
+    d.setHours(0, 0, 0, 0);
     let t = d.getTime() / 1000;
-    if (rangeKey === "24h") t = Math.ceil(t / 10800) * 10800;
+    if (step < 86400) t += Math.ceil((min - t) / step) * step;
     const out = [];
     for (; t <= max; t += step) if (t >= min) out.push(t);
-    if (rangeKey === "24h" && out.length > 6 && u.width < 500) return out.filter((_, i) => i % 2 === 0);
-    if (rangeKey === "7d" && u.width < 500) return out.filter((_, i) => i % 2 === 0);
     return out;
   };
+}
+
+// errors（ok 以外の取得）を、続いている区間にまとめる。
+// ログイン切れが続くと 10 分おきに印が並んでうるさいので、続いているものは細い帯 1 本にする。
+// 「続いている」= 間に値の取れた点（線の点）が無く、取得の抜け（gaps）もまたいでいない。
+// pointTimes はそのアカウントの点の時刻（昇順）。戻り値は [{from, to, n}]（n = まとめた件数）。
+function errorSpans(errors, pointTimes, gaps) {
+  const hasPointBetween = (a, b) => {
+    let lo = 0, hi = pointTimes.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (pointTimes[m] <= a) lo = m + 1; else hi = m; }
+    return lo < pointTimes.length && pointTimes[lo] < b;
+  };
+  const spans = [];
+  for (const e of [...errors].sort((a, b) => a.t - b.t)) {
+    const last = spans[spans.length - 1];
+    if (last && !hasPointBetween(last.to, e.t) && !gaps.some((g) => g.from < e.t && g.to > last.to)) {
+      last.to = e.t;
+      last.n++;
+    } else spans.push({ from: e.t, to: e.t, n: 1 });
+  }
+  return spans;
+}
+function accountPointTimes(history, accountId) {
+  return history.series.filter((s) => s.account_id === accountId)
+    .flatMap((s) => s.segments.flatMap((g) => g.points.map((p) => p[0])))
+    .sort((a, b) => a - b);
+}
+// ツールチップ用: その時刻が errors の区間（または 1 件だけの印の近く）に入っているか
+const inErrorSpan = (spans, t) => spans.some((s) => t >= s.from - 900 && t <= s.to + 900);
+
+// errors を下端に描く。1 件だけなら小さな三角、続いているものは細い帯。
+function drawErrors(u, spans, color) {
+  const { ctx } = u;
+  const dpr = devicePixelRatio;
+  const y = u.bbox.top + u.bbox.height - 1 * dpr;
+  ctx.fillStyle = color;
+  let lastX = -99;
+  for (const s of spans) {
+    const x0 = u.valToPos(s.from, "x", true);
+    if (s.n === 1) {
+      if (x0 - lastX < 5 * dpr) continue; // 同じ画素に重なる印は1つにまとめる
+      lastX = x0;
+      ctx.beginPath();
+      ctx.moveTo(x0, y - 5 * dpr); ctx.lineTo(x0 - 3 * dpr, y); ctx.lineTo(x0 + 3 * dpr, y);
+      ctx.closePath(); ctx.fill();
+    } else {
+      const x1 = Math.max(u.valToPos(s.to, "x", true), x0 + 3 * dpr);
+      ctx.beginPath();
+      ctx.roundRect ? ctx.roundRect(x0, y - 3 * dpr, x1 - x0, 3 * dpr, 1.5 * dpr) : ctx.rect(x0, y - 3 * dpr, x1 - x0, 3 * dpr);
+      ctx.fill();
+      lastX = x1;
+    }
+  }
 }
 
 function hatchPattern(ctx, color) {
@@ -137,9 +200,11 @@ function hatchPattern(ctx, color) {
 }
 
 // ---- 重ね合わせ ------------------------------------------------------------------------
-// opts: { el, history, kind, accounts:[{id,label,color}], hidden:Set, focus, range }
+// opts: { el, history, kind, accounts:[{id,label,color}], hidden:Set, focus, xMin }
+// xMin: x 軸の左端（データが期間より短いときに詰める。省略すると history.since）
 export function overlayChart(opts) {
-  const { el, history, kind, accounts, range } = opts;
+  const { el, history, kind, accounts } = opts;
+  const xMin = opts.xMin ?? history.since;
   const tk = themeTokens();
   const items = accounts.map((a) => {
     const s = history.series.find((x) => x.account_id === a.id && x.kind === kind);
@@ -147,9 +212,9 @@ export function overlayChart(opts) {
     const { runs, isolated } = toRuns(s, gaps);
     return { ...a, line: readableColor(a.color, tk.bg), runs, isolated, gaps,
       resets: history.resets.filter((r) => r.account_id === a.id && r.kind === kind),
-      errors: history.errors.filter((e) => e.account_id === a.id) };
+      errSpans: errorSpans(history.errors.filter((e) => e.account_id === a.id), accountPointTimes(history, a.id), gaps) };
   });
-  const data = [[history.since, history.until], ...items.map(() => [null, null])];
+  const data = [[xMin, history.until], ...items.map(() => [null, null])];
 
   let focus = opts.focus;
   let hidden = new Set(opts.hidden);
@@ -172,12 +237,12 @@ export function overlayChart(opts) {
       y: false,
     },
     scales: {
-      x: { time: true, range: () => [history.since, history.until] },
+      x: { time: true, range: () => [xMin, history.until] },
       y: { range: [0, 100] },
     },
     axes: [
       { stroke: tk.axis, font: tk.font, grid: { stroke: tk.grid, width: 1 }, ticks: { show: false },
-        splits: xSplits(range), values: xAxisValues(range), gap: 6, size: 28 },
+        splits: xSplits(), values: xAxisValues(), gap: 6, size: 28 },
       { stroke: tk.axis, font: tk.font, grid: { stroke: tk.grid, width: 1 }, ticks: { show: false },
         splits: () => [0, 25, 50, 75, 100], values: (u, s) => s.map((v) => v + "%"), size: 40, gap: 4 },
     ],
@@ -201,7 +266,7 @@ export function overlayChart(opts) {
         // 表示中のアカウントの gaps を1本にまとめてから塗る（PC のスリープ等は全アカウント同時に起きるので、
         // 重ね塗りで濃くならないように）
         const spans = items.filter((it, i) => u.series[i + 1].show).flatMap((it) => it.gaps)
-          .map((g) => [Math.max(g.from, history.since), Math.min(g.to, history.until)])
+          .map((g) => [Math.max(g.from, xMin), Math.min(g.to, history.until)])
           .filter(([a, b]) => b > a).sort((a, b) => a[0] - b[0]);
         const merged = [];
         for (const sp of spans) {
@@ -243,18 +308,8 @@ export function overlayChart(opts) {
             ctx.arc(u.valToPos(t, "x", true), u.valToPos(v, "y", true), 2.2 * dpr, 0, Math.PI * 2);
             ctx.fill();
           }
-          // errors: 下端に小さな三角。同じ画素に重なるものは1つにまとめる
-          let lastX = -99;
-          ctx.fillStyle = withAlpha(it.line, focus && focus !== it.id ? 0.25 : 0.9);
-          for (const e of it.errors) {
-            const x = u.valToPos(e.t, "x", true);
-            if (x - lastX < 5 * dpr) continue;
-            lastX = x;
-            const y = top + ph - 1 * dpr;
-            ctx.beginPath();
-            ctx.moveTo(x, y - 5 * dpr); ctx.lineTo(x - 3 * dpr, y); ctx.lineTo(x + 3 * dpr, y);
-            ctx.closePath(); ctx.fill();
-          }
+          // errors: 下端に小さな三角（続いているものは細い帯）
+          drawErrors(u, it.errSpans, withAlpha(it.line, focus && focus !== it.id ? 0.25 : 0.8));
         });
         ctx.restore();
       }],
@@ -264,9 +319,9 @@ export function overlayChart(opts) {
         const t = u.posToVal(left, "x");
         const rows = items
           .filter((it, i) => u.series[i + 1].show)
-          .map((it) => ({ it, v: valueAt(it.runs, t), err: it.errors.find((e) => Math.abs(e.t - t) < 1800) }));
+          .map((it) => ({ it, v: valueAt(it.runs, t), err: inErrorSpan(it.errSpans, t) }));
         if (!rows.length) { tip.hidden = true; return; }
-        tip.replaceChildren(
+        setChildren(tip,
           h("div.tip-time", fmtDateTime(t)),
           ...rows.map(({ it, v, err }) => h("div.tip-row", { class: focus === it.id ? "is-focus" : "" }, [
             h("span.sw", { style: { background: it.line } }),
@@ -310,7 +365,8 @@ export function overlayChart(opts) {
 // ---- 分割表示（small multiples） ----------------------------------------------------------
 // 1行1アカウント。週間を線、5h を薄い面にする。カーソルは全行で同期する。
 export function multiplesChart(opts) {
-  const { el, history, accounts, range, focus } = opts;
+  const { el, history, accounts, focus } = opts;
+  const xMin = opts.xMin ?? history.since;
   const tk = themeTokens();
   const sync = uPlot.sync("ccsmoni-multi");
   const charts = [];
@@ -328,9 +384,9 @@ export function multiplesChart(opts) {
     const gaps = history.gaps.filter((g) => g.account_id === a.id);
     const wk = toRuns(history.series.find((s) => s.account_id === a.id && s.kind === "weekly_all"), gaps);
     const ss = toRuns(history.series.find((s) => s.account_id === a.id && s.kind === "session"), gaps);
-    const data = [[history.since, history.until], [null, null], [null, null]];
+    const data = [[xMin, history.until], [null, null], [null, null]];
     const resets = history.resets.filter((r) => r.account_id === a.id && r.kind === "weekly_all");
-    const errors = history.errors.filter((e) => e.account_id === a.id);
+    const errSpans = errorSpans(history.errors.filter((e) => e.account_id === a.id), accountPointTimes(history, a.id), gaps);
     const readout = h("span.multi-read.num");
     const showReadout = (t) => {
       if (t == null) {
@@ -355,10 +411,10 @@ export function multiplesChart(opts) {
       padding: [6, 8, last ? 0 : 8, 0],
       legend: { show: false },
       cursor: { drag: { x: false, y: false }, points: { show: false }, y: false, sync: { key: sync.key } },
-      scales: { x: { time: true, range: () => [history.since, history.until] }, y: { range: [0, 100] } },
+      scales: { x: { time: true, range: () => [xMin, history.until] }, y: { range: [0, 100] } },
       axes: [
         { show: last, stroke: tk.axis, font: tk.font, grid: { stroke: tk.grid, width: 1 }, ticks: { show: false },
-          splits: xSplits(range), values: xAxisValues(range), size: 26, gap: 6 },
+          splits: xSplits(), values: xAxisValues(), size: 26, gap: 6 },
         { stroke: tk.axis, font: tk.font, grid: { stroke: tk.grid, width: 1 }, ticks: { show: false },
           splits: () => [0, 50, 100], values: (u, s) => s.map((v) => v + "%"), size: 40, gap: 4 },
       ],
@@ -374,7 +430,7 @@ export function multiplesChart(opts) {
           ctx.save();
           ctx.fillStyle = hatchPattern(ctx, tk.hatch);
           for (const g of gaps) {
-            const x0 = u.valToPos(Math.max(g.from, history.since), "x", true);
+            const x0 = u.valToPos(Math.max(g.from, xMin), "x", true);
             const x1 = u.valToPos(Math.min(g.to, history.until), "x", true);
             if (x1 > x0) ctx.fillRect(x0, top, x1 - x0, ph);
           }
@@ -387,22 +443,11 @@ export function multiplesChart(opts) {
           ctx.restore();
         }],
         draw: [(u) => {
-          const { ctx } = u;
-          const dpr = devicePixelRatio;
-          const y = u.bbox.top + u.bbox.height - dpr;
           strokeRuns(u, ss.runs, { stroke: withAlpha(line, 0.35), width: 1, fill: withAlpha(line, 0.13) });
           strokeRuns(u, wk.runs, { stroke: line, width: 1.8 });
-          ctx.save();
-          ctx.fillStyle = withAlpha(line, 0.9);
-          let lastX = -99;
-          for (const e of errors) {
-            const x = u.valToPos(e.t, "x", true);
-            if (x - lastX < 5 * dpr) continue;
-            lastX = x;
-            ctx.beginPath(); ctx.moveTo(x, y - 5 * dpr); ctx.lineTo(x - 3 * dpr, y); ctx.lineTo(x + 3 * dpr, y);
-            ctx.closePath(); ctx.fill();
-          }
-          ctx.restore();
+          u.ctx.save();
+          drawErrors(u, errSpans, withAlpha(line, 0.8));
+          u.ctx.restore();
         }],
         setCursor: [(u) => {
           const { left } = u.cursor;

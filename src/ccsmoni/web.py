@@ -105,7 +105,8 @@ def build_account_state(rt: Runtime, index: int, a: Any, latest: dict[str, Readi
     interval = cfg.interval_for(a.id)
     reading = latest.get(a.id)
     meta = store.get_account_meta(a.id) or {}
-    rows = store.history(_dt(now - 86400), account_ids=[a.id]) if reading is not None else []
+    # 枯渇予測の「直近 24 時間の速度」に使う（取得時刻の揺れの分だけ少し広めに取る。insights.RECENT_SLACK）
+    rows = store.history(_dt(now - 86400 - 3600), account_ids=[a.id]) if reading is not None else []
     next_run = rt.services.scheduler.next_run_at(a.id) if a.enabled else None
     st: dict[str, Any] = {
         "id": a.id,

@@ -20,11 +20,19 @@ from ccsmoni.model import Limit
 SESSION_SEC = 5 * 3600
 WEEK_SEC = 7 * 24 * 3600
 
-# 枯渇予測で「直近の増加速度」を見る範囲と、速度を信用するための最低限の点数・時間幅。
-# 5h 枠は短い時間で増減するので直近 1 時間、週間枠は日単位の使い方を見たいので直近 24 時間。
+# 枯渇予測の速度の取り方:
+#   基本は「枠の開始（resets_at - 枠の長さ）から今までの平均速度」。
+#   直近の履歴が RECENT_LOOKBACK 分そろっているときだけ、その区間の増加速度（最小二乗の傾き）を使う。
+#   以前は 20 分〜3 時間ぶんの点で傾きを取っていたため、使い始めの 1 時間の勢いをそのまま 5 日分延ばして
+#   「今日の夜に週間上限」のような早すぎる予測が出た。週間枠は 1 日単位の使い方（寝ている時間を含む）で、
+#   5h 枠は 1 時間単位で見る。
+# RECENT_SLACK は取得の時刻の揺れ（10 分おき＋数十秒）を吸収するための余裕。
 RECENT_LOOKBACK = {"session": 3600, "weekly": 24 * 3600}
-MIN_SPAN = {"session": 20 * 60, "weekly": 3 * 3600}
+RECENT_SLACK = {"session": 10 * 60, "weekly": 30 * 60}
 MIN_POINTS = 3
+# 予測を出す最低条件: 枠が始まってからこれだけたっていること。
+# 始まった直後は、少し使っただけで平均速度が極端に大きくなり、当てにならないため。
+MIN_ELAPSED = {"session": 30 * 60, "weekly": 12 * 3600}
 
 # 「使わないと損」: 週間リセットまで 36 時間以内、かつ残量が 30% 以上
 LOSE_WITHIN_HOURS = 36
@@ -95,7 +103,8 @@ def _eta_full(
 ) -> float | None:
     """このペースだと 100% に達する時刻。リセットまでに達しないなら None。
 
-    直近の点が十分にあればその増加速度、足りなければ枠の開始からの平均速度を使う。
+    基本は枠の開始からの平均速度。直近 RECENT_LOOKBACK 分の履歴がそろっているときだけ、その区間の増加速度を使う。
+    枠が始まって MIN_ELAPSED たつまでは予測しない（すでに 100% のときを除く）。
     """
     length = window_length(kind)
     family = _family(kind)
@@ -103,15 +112,16 @@ def _eta_full(
         return None
     if percent >= 100:
         return now  # すでに上限
+    elapsed = now - (resets_at - length)
+    if elapsed < MIN_ELAPSED[family]:
+        return None
 
-    recent = sorted((t, p) for t, p in points if now - RECENT_LOOKBACK[family] <= t <= now)
-    if len(recent) >= MIN_POINTS and recent[-1][0] - recent[0][0] >= MIN_SPAN[family]:
+    lookback, slack = RECENT_LOOKBACK[family], RECENT_SLACK[family]
+    recent = sorted((t, p) for t, p in points if now - lookback - slack <= t <= now)
+    if len(recent) >= MIN_POINTS and recent[-1][0] - recent[0][0] >= lookback - slack:
         rate = _slope(recent)
         anchor_t, anchor_p = recent[-1][0], max(recent[-1][1], percent)
     else:
-        elapsed = now - (resets_at - length)
-        if elapsed <= 0:
-            return None
         rate = percent / elapsed
         anchor_t, anchor_p = now, percent
     if rate <= 0:

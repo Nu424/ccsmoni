@@ -4,13 +4,18 @@
 // 方針: フレームワークは使わず、h() で要素を作る小さな関数群にする。状態は持たない（トーストを除く）。
 
 // ---- DOM ヘルパー -------------------------------------------------------
-// h("div.card.is-ok", {onclick}, [子...]) の形で要素を作る。文字列の子はテキストになる。
+// h("div.card.is-ok", {onclick}, [子...]) の形で要素を作る。文字列・数値の子はテキストになる。
+// 子の扱い（ここで一度だけ決めて、呼び出し側で気にしなくてよいようにする）:
+//   - null / undefined / true / false は何も出さない（`cond ? h(...) : null` や `cond && h(...)` をそのまま書ける）
+//   - 配列は入れ子でも平らにする（以前は1段しか平らにせず、[a, [null, null]] の内側の配列が String() されて
+//     「,」が画面に出ていた。append() に null を直接渡すと「null」という文字になるのも同じ種類の事故）
+//   - 第2引数が属性でない（文字列・数値・Node・配列・null）なら、それを子として扱う
 export function h(tag, attrs = {}, children = []) {
   const [name, ...classes] = tag.split(".");
   const el = document.createElement(name || "div");
   if (classes.length) el.className = classes.join(" ");
-  if (Array.isArray(attrs) || typeof attrs === "string" || attrs instanceof Node) {
-    children = attrs;
+  if (attrs == null || typeof attrs !== "object" || Array.isArray(attrs) || attrs instanceof Node) {
+    if (attrs != null || arguments.length < 3) children = attrs;
     attrs = {};
   }
   for (const [k, v] of Object.entries(attrs)) {
@@ -27,10 +32,25 @@ export function h(tag, attrs = {}, children = []) {
     else if (k in el && typeof v !== "string") el[k] = v;
     else el.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of [].concat(children)) {
-    if (c == null || c === false) continue;
-    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  }
+  el.append(...nodes(children));
+  return el;
+}
+
+// 子の指定（h() の children と同じ書き方）を Node の配列にする。
+// replaceChildren(...) / append(...) に null や配列を渡すと「null」「a,b」という文字になってしまうので、
+// h() を通さずに子を入れ替えるときも、必ずこれを通す（setChildren を使う）。
+export function nodes(children) {
+  const out = [];
+  const walk = (c) => {
+    if (c == null || c === false || c === true) return;
+    if (Array.isArray(c)) { c.forEach(walk); return; }
+    out.push(c instanceof Node ? c : document.createTextNode(String(c)));
+  };
+  walk(children);
+  return out;
+}
+export function setChildren(el, ...children) {
+  el.replaceChildren(...nodes(children));
   return el;
 }
 
