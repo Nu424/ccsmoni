@@ -1,0 +1,12 @@
+# 機密情報を含むローカル専用ファイル（実出力サンプル・禁止語リストなど）
+local/
+# 実設定・DB
+ccsmoni.toml
+*.db
+*.db-wal
+*.db-shm
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/

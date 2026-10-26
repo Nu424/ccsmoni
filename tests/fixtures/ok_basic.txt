@@ -1,0 +1,13 @@
+﻿You are currently using your subscription to power your Claude Code usage
+
+Current session: 6% used · resets Oct 27, 4:20am (Asia/Tokyo)
+Current week (all models): 12% used · resets Oct 30, 4pm (Asia/Tokyo)
+
+What's contributing to your limits usage?
+Approximate · sessions on this machine only · shares overlap
+
+Last 24h · 6 requests · 2 sessions
+  59%  See what fills your context · run /context
+
+Last 7d · 23 requests · 3 sessions
+  14%  See what fills your context · run /context

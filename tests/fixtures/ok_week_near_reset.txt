@@ -1,0 +1,16 @@
+﻿You are currently using your subscription to power your Claude Code usage
+
+Current session: 3% used · resets Oct 27, 6:59am (Asia/Tokyo)
+Current week (all models): 64% used · resets Oct 27, 11:59am (Asia/Tokyo)
+Current week (Fable): 94% used · resets Oct 27, 11:59am (Asia/Tokyo)
+
+What's contributing to your limits usage?
+Approximate · sessions on this machine only · shares overlap
+
+Last 24h · 22 requests · 1 session
+  36%  See what fills your context · run /context
+
+Last 7d · 363 requests · 3 sessions
+  76%  Start fresh when you switch tasks · run /clear
+  11%  Run /render-skill on a cheaper model
+  Top skills: /render-skill 11%
