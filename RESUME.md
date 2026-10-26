@@ -4,6 +4,7 @@
 
 ## 現在地（2026-10-27）
 - MVP 完成。計画のステップ 0〜10 は完了
+- ダッシュボードは UI v2（docs/UI-V2.md）に作り直した。プロトタイプと比較は prototypes/。独立レビューへの対処は REVIEW.md の後半
   - 独立レビュー（Codex CLI と新規サブエージェント）の指摘への対処は [docs/REVIEW.md](docs/REVIEW.md) に記録
 - テスト: `uv run pytest -q` で 150 件
 - 実環境で動作確認済み（取得・ログイン切れの検知・画面表示・Host の検証）
