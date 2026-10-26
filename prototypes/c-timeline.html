@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccsmoni Timeline</title>
+<script>
+  // ?theme=dark / ?theme=light を最初に反映（ちらつき防止）
+  (function () {
+    var t = new URLSearchParams(location.search).get("theme");
+    if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
+<link rel="stylesheet" href="c-timeline.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><rect x="1" y="1" width="18" height="18" rx="5" fill="currentColor"/><path d="M4.5 13.5l3.5-4 3 2.5 4.5-6" fill="none" stroke="var(--surface)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>ccsmoni</span>
+    </div>
+    <nav class="tabs" aria-label="画面">
+      <a href="#" class="on" aria-current="page">推移</a><a href="#">設定</a>
+    </nav>
+    <div class="summary" id="summary"></div>
+    <div class="top-right">
+      <div class="cand" id="cand"></div>
+      <div class="upd" id="upd"></div>
+      <button class="btn primary" id="refresh" type="button">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        今すぐ更新
+      </button>
+      <button class="btn icon" id="theme" type="button" aria-label="テーマを切り替え">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13 9.5A5.5 5.5 0 0 1 6.5 3a5.5 5.5 0 1 0 6.5 6.5z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <aside class="rail" aria-label="アカウント">
+      <div class="rail-head">
+        <h2>アカウント</h2>
+        <span class="rail-tip">クリックで表示切替・ダブルクリックで単独</span>
+      </div>
+      <div class="rail-cols" aria-hidden="true"><span></span><span>使用率</span><span>%</span><span>リセット</span></div>
+      <ul class="rail-list" id="rail"></ul>
+      <div class="up" id="up"></div>
+      <div class="rail-foot" id="railfoot"></div>
+    </aside>
+
+    <section class="ana" aria-label="推移">
+      <div class="ana-bar">
+        <h2>推移</h2>
+        <div class="seg" id="range" role="radiogroup" aria-label="期間"></div>
+        <span class="span-label" id="spanlabel"></span>
+        <div class="keys" aria-hidden="true">
+          <span class="k"><i class="k-dot"></i>観測</span>
+          <span class="k"><i class="k-reset"></i>週間リセット</span>
+          <span class="k"><i class="k-gap"></i>取得なし</span>
+          <span class="k"><i class="k-err"></i>エラー</span>
+        </div>
+      </div>
+      <div class="chart" id="chart">
+        <svg id="svg" role="img" aria-label="週間と5時間枠の使用率の推移"></svg>
+        <div class="tip" id="tip" hidden></div>
+      </div>
+      <div class="heats">
+        <div class="heat" id="heatW"></div>
+        <div class="heat" id="heatS"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="pop" id="pop" hidden></div>
+<div class="toast" id="toast" hidden></div>
+<script src="demo-data.js"></script>
+<script src="c-timeline.js"></script>
+</body>
+</html>
