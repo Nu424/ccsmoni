@@ -124,6 +124,28 @@ class CliUsageSource:
             CliUsageSource._version_cache[key] = r.stdout.strip() or None if r.exit_code == 0 else None
         return CliUsageSource._version_cache[key]
 
+    # ---- ログイン状態 ----
+
+    def _auth(self, config_dir: str) -> tuple[_Run, dict[str, Any] | None, str | None]:
+        """`claude auth status --json` を実行する。戻り値は (実行結果, 残してよいキーだけの dict, 読めなかった理由)。"""
+        r = self._run(["auth", "status", "--json"], config_dir)
+        if r.error or r.timed_out:
+            return r, None, r.error or "auth status がタイムアウトしました"
+        try:
+            data = json.loads(r.stdout)
+            if not isinstance(data, dict):
+                raise ValueError("JSON object ではありません")
+        except ValueError as e:
+            return r, None, f"auth status を読めませんでした: {e}"
+        return r, {k: data[k] for k in _AUTH_KEEP_KEYS if k in data}, None
+
+    def auth_status(self, account: Account) -> dict[str, Any] | None:
+        """ログイン状態だけを確かめる（LoginService が完了を待つのに使う）。読めなければ None。
+
+        返すのは loggedIn / orgId など _AUTH_KEEP_KEYS のキーだけ（メールアドレスなどは捨てる）。
+        """
+        return self._auth(str(account.config_dir))[1]
+
     # ---- 取得 ----
 
     def fetch(self, account: Account) -> RawResult:
@@ -145,21 +167,13 @@ class CliUsageSource:
         config_dir = str(account.config_dir)
 
         # 1. ログイン状態。ログイン切れでも exit 1 + JSON なので、終了コードでなく中身を見る。
-        auth = self._run(["auth", "status", "--json"], config_dir)
+        auth, auth_json, auth_error = self._auth(config_dir)
         if auth.error or auth.timed_out:
             return done(exit_code=auth.exit_code, timed_out=auth.timed_out, error=auth.error)
-        try:
-            auth_json = json.loads(auth.stdout)
-            if not isinstance(auth_json, dict):
-                raise ValueError("JSON object ではありません")
-        except ValueError as e:
-            meta["auth_error"] = f"auth status を読めませんでした: {e}"
-            return done(
-                text=auth.stdout,
-                exit_code=auth.exit_code,
-                error=meta["auth_error"],
-            )
-        meta["auth"] = {k: auth_json[k] for k in _AUTH_KEEP_KEYS if k in auth_json}
+        if auth_json is None:
+            meta["auth_error"] = auth_error
+            return done(text=auth.stdout, exit_code=auth.exit_code, error=auth_error)
+        meta["auth"] = auth_json
 
         # 2. ログイン切れなら /usage は実行しない（実行するとコスト表示になり紛らわしい）。
         if auth_json.get("loggedIn") is not True:

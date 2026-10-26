@@ -9,39 +9,64 @@ import sys
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ccsmoni", description="Claude Code s monitor — 利用状況の記録と可視化")
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("serve", help="常駐して定期取得し、ダッシュボードを配信する")
+    serve = sub.add_parser("serve", help="常駐して定期取得し、ダッシュボードを配信する")
+    serve.add_argument("--port", type=int, help="待ち受けるポート（省略時は設定の server.port）")
+    serve.add_argument("--no-browser", action="store_true", help="起動後にブラウザを開かない")
+    serve.add_argument("--demo", action="store_true", help="claude を呼ばず、デモの架空データで動かす（ccsmoni demo で作った CCSMONI_HOME 専用）")
     parse = sub.add_parser("parse", help="保存済みの /usage テキストを読み、Reading の JSON を出力する")
     parse.add_argument("file", help="/usage の出力を保存したテキストファイル")
     parse.add_argument("--taken-at", help="取得時刻（ISO 8601。省略時は現在時刻）")
     collect = sub.add_parser("collect", help="claude CLI で各アカウントの /usage を取得する")
     collect.add_argument("--once", action="store_true", help="1回だけ取得して終了する")
     collect.add_argument("--print", action="store_true", dest="print_table", help="結果を表で表示する")
-    collect.add_argument("--config-dir", action="append", required=True, help="CLAUDE_CONFIG_DIR（複数指定可。id はディレクトリ名）")
+    collect.add_argument("--config-dir", action="append", help="CLAUDE_CONFIG_DIR（複数指定可。id はディレクトリ名）。省略時は設定の有効なアカウント")
+    collect.add_argument("--save", action="store_true", help="結果を DB に保存する")
+    sub.add_parser("reparse", help="保存済みの raw をパーサーで読み直し、DB の解釈結果を作り直す")
+    demo = sub.add_parser("demo", help="架空の 4 アカウントの設定と 30 日分の合成履歴を作る（UI の確認用）")
+    demo.add_argument("--home", required=True, help="作成先のディレクトリ（serve するときは CCSMONI_HOME にこれを指定）")
+    demo.add_argument("--days", type=int, default=30, help="履歴の日数（既定 30）")
+    demo.add_argument("--force", action="store_true", help="既存のデモを作り直す")
     return p
 
 
 def _cmd_collect(args: argparse.Namespace) -> int:
-    # 設定ファイルができるまでの暫定: --config-dir で直接指定し、アカウント id はディレクトリ名にする。
+    # --config-dir を指定したらそのディレクトリ（id はディレクトリ名）、省略したら設定の有効なアカウントを取得する。
     # 並列にはせず順に取得する（認証まわりの競合を避けるため）。
     from pathlib import Path
 
+    from ccsmoni.config import AppConfig, ConfigService, config_path, db_path
     from ccsmoni.model import Account
-    from ccsmoni.probes.cli_usage import CliUsageSource
+    from ccsmoni.scheduler import default_probe_factory
 
-    try:
-        from ccsmoni.parser_usage import UsageTextParser
-    except ImportError:
-        UsageTextParser = None  # パーサー未実装なら raw の要約だけ出す
+    # ディレクトリを直接指定したときは、設定ファイルが無くても作らない（既定値で取得する）
+    if args.config_dir and not config_path().exists():
+        cfg = AppConfig()
+    else:
+        cfg, _ = ConfigService(config_path()).load()
+    probe = default_probe_factory(cfg)
+    if args.config_dir:
+        accounts = []
+        for d in args.config_dir:
+            path = Path(d).expanduser().resolve()
+            accounts.append(Account(id=path.name, label=path.name, config_dir=path))
+    else:
+        accounts = cfg.active_accounts()
+        if not accounts:
+            print(f"有効なアカウントがありません（設定: {config_path()}）", file=sys.stderr)
+            return 1
 
-    source = CliUsageSource()
+    store = None
+    if args.save:
+        from ccsmoni.store import Store
+
+        db_path().parent.mkdir(parents=True, exist_ok=True)
+        store = Store(db_path())
     rows = []
-    for d in args.config_dir:
-        path = Path(d).expanduser().resolve()
-        account = Account(id=path.name, label=path.name, config_dir=path)
-        raw = source.fetch(account)
-        secs = f"{raw.duration_ms / 1000:.1f}s"
-        if UsageTextParser is not None:
-            reading = UsageTextParser().parse(raw, account.id)
+    try:
+        for account in accounts:
+            raw, reading = probe.run(account)
+            if store is not None:
+                store.save(raw, reading)
             session = reading.limit("session")
             weekly = reading.limit("weekly_all")
             resets = next((lim.resets_at for lim in reading.limits if lim.resets_at), None)
@@ -51,15 +76,118 @@ def _cmd_collect(args: argparse.Namespace) -> int:
                 f"{session.percent:g}%" if session else "-",
                 f"{weekly.percent:g}%" if weekly else "-",
                 resets.astimezone().strftime("%m/%d %H:%M") if resets else "-",
-                secs,
+                f"{raw.duration_ms / 1000:.1f}s",
             ))
-        else:
-            first = next(iter(raw.text.splitlines()), "")
-            rows.append((account.id, f"exit={raw.exit_code}", raw.error or ("timeout" if raw.timed_out else ""), first[:40], "-", secs))
+    finally:
+        if store is not None:
+            store.close()
     header = ("id", "status", "session%", "weekly%", "resets", "time")
     widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
     for r in [header, *rows]:
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
+    if store is not None:
+        print(f"{len(rows)} 件を保存しました")
+    return 0
+
+
+def _cmd_reparse(args: argparse.Namespace) -> int:
+    from ccsmoni.config import db_path
+    from ccsmoni.parser_usage import UsageTextParser
+    from ccsmoni.store import Store
+
+    if not db_path().exists():
+        print(f"DB がありません: {db_path()}", file=sys.stderr)
+        return 1
+    store = Store(db_path())
+    try:
+        n = store.reparse(UsageTextParser())
+    finally:
+        store.close()
+    print(f"{n} 件を読み直しました")
+    return 0
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from ccsmoni.demo import create_demo_home
+
+    home = Path(args.home).expanduser().resolve()
+    try:
+        counts = create_demo_home(home, days=args.days, force=args.force)
+    except FileExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"デモを作りました: {home}")
+    for aid, n in counts.items():
+        print(f"  {aid}: {n} 件")
+    print("起動するには（PowerShell）:")
+    print(f'  $env:CCSMONI_HOME = "{home}"; uv run ccsmoni serve --demo')
+    return 0
+
+
+def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    # 準備ができたら（ポートに接続できたら）既定のブラウザで開く。すでに起動していれば、開くだけで終わる。
+    import logging
+    import threading
+    import time
+    import webbrowser
+
+    import uvicorn
+
+    from ccsmoni.config import app_home
+    from ccsmoni.web import build_services, create_app
+
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(message)s", datefmt="%m/%d %H:%M:%S"
+    )
+    if args.demo:
+        from ccsmoni.demo import DEMO_MARKER
+
+        if not (app_home() / DEMO_MARKER).exists():
+            print(
+                "--demo は、ccsmoni demo --home <dir> で作ったディレクトリを CCSMONI_HOME に指定したときだけ使えます",
+                file=sys.stderr,
+            )
+            return 1
+
+    services = build_services(demo=args.demo)
+    cfg = services.config_service.current
+    host = cfg.server.host
+    port = args.port or cfg.server.port
+    url = f"http://127.0.0.1:{port}"
+    if _port_open("127.0.0.1", port):
+        print(f"すでに起動しています: {url}")
+        if not args.no_browser:
+            webbrowser.open(url)
+        services.store.close()
+        return 0
+
+    def open_when_ready() -> None:
+        for _ in range(120):
+            if _port_open("127.0.0.1", port):
+                webbrowser.open(url)
+                return
+            time.sleep(0.25)
+
+    if not args.no_browser:
+        threading.Thread(target=open_when_ready, daemon=True).start()
+    print(f"ccsmoni を起動します: {url}" + ("（デモ）" if args.demo else ""), flush=True)
+    app = create_app(services)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
+    finally:
+        services.store.close()
     return 0
 
 
@@ -97,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_parse(args)
     if args.command == "collect":
         return _cmd_collect(args)
+    if args.command == "reparse":
+        return _cmd_reparse(args)
+    if args.command == "demo":
+        return _cmd_demo(args)
+    if args.command == "serve":
+        return _cmd_serve(args)
     print(f"'{args.command}' は未実装です", file=sys.stderr)
     return 1
 

@@ -390,6 +390,20 @@ class ConfigService:
 
     # --- 変更検知 ---------------------------------------------------------
 
+    @property
+    def current(self) -> AppConfig | None:
+        """最後に load/save/poll で取り込んだ（検証済みの）設定。"""
+        return self._current
+
+    @property
+    def current_hash(self) -> str | None:
+        """current に対応するファイル内容のハッシュ（UI の楽観ロックに渡す値）。"""
+        return self._hash
+
+    def file_hash(self) -> str:
+        """いまのファイル内容のハッシュ（壊れていても計算する。409 で UI に返す用）。"""
+        return self._read()[1]
+
     def changed_since(self, h: str) -> bool:
         return self._read()[1] != h
 
