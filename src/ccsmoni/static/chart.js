@@ -178,10 +178,17 @@ function drawErrors(u, spans, color) {
       ctx.moveTo(x0, y - 5 * dpr); ctx.lineTo(x0 - 3 * dpr, y); ctx.lineTo(x0 + 3 * dpr, y);
       ctx.closePath(); ctx.fill();
     } else {
+      // 帯は破線＋半透明にする。実線だと「0% のデータの線」と見分けがつかないため
       const x1 = Math.max(u.valToPos(s.to, "x", true), x0 + 3 * dpr);
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3 * dpr;
+      ctx.setLineDash([2 * dpr, 4 * dpr]);
       ctx.beginPath();
-      ctx.roundRect ? ctx.roundRect(x0, y - 3 * dpr, x1 - x0, 3 * dpr, 1.5 * dpr) : ctx.rect(x0, y - 3 * dpr, x1 - x0, 3 * dpr);
-      ctx.fill();
+      ctx.moveTo(x0, y - 1.5 * dpr); ctx.lineTo(x1, y - 1.5 * dpr);
+      ctx.stroke();
+      ctx.restore();
       lastX = x1;
     }
   }

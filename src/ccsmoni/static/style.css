@@ -343,7 +343,7 @@ code.inline { background: var(--surface); border: 1px solid var(--border); borde
 .mk-reset { width: 0; height: 12px; border-left: 1.5px dashed var(--text-3); }
 .mk-gap { width: 16px; height: 11px; border-radius: 2px; background: repeating-linear-gradient(135deg, var(--hatch) 0 1px, transparent 1px 4px); border: 1px solid var(--border); }
 .mk-err { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-bottom: 6px solid var(--text-3); }
-.mk-errband { width: 14px; height: 3px; border-radius: 1.5px; background: var(--text-3); }
+.mk-errband { width: 14px; height: 3px; opacity: .7; background: repeating-linear-gradient(90deg, var(--text-3) 0 2px, transparent 2px 6px); }
 .mk-line { width: 16px; height: 2px; border-radius: 1px; background: var(--text-3); }
 .mk-area { width: 16px; height: 10px; border-radius: 2px; background: color-mix(in srgb, var(--text-3) 22%, transparent); }
 .uplot { font-family: var(--font-ui); }

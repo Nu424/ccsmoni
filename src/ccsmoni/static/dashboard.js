@@ -536,7 +536,7 @@ export function createDashboard(ctx) {
       dash.mode === "multi" ? h("span.note-item", [h("i.mk-area"), "5h"]) : null,
       h("span.note-item", [h("i.mk-reset"), "リセット"]),
       h("span.note-item", [h("i.mk-gap"), "取得できなかった区間"]),
-      h("span.note-item", [h("i.mk-err"), h("i.mk-errband"), "エラー（ログイン切れなど。続いたものは帯）"]),
+      h("span.note-item", [h("i.mk-err"), h("i.mk-errband"), "取得できず（ログイン切れなど。続いたものは点線）"]),
     ]);
   }
 
