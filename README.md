@@ -64,7 +64,8 @@ claude -p /usage --output-format json --no-session-persistence
 ccsmoni.bat --setup-tailscale
 ```
 
-- `tailscale serve --bg <ポート>` を実行し、`https://<PC名>.<tailnet名>.ts.net/` で開けるようにします。設定は Tailscale 側に保存されるので、実行するのは初回だけです。
+- ccsmoni 専用の HTTPS ポート（既定 8484）で公開し、`https://<PC名>.<tailnet名>.ts.net:8484/` で開けるようにします（`tailscale serve --bg --https=8484 http://127.0.0.1:8484`）。設定は Tailscale 側に保存されるので、実行するのは初回だけです。
+- **同じ PC で別のアプリが tailscale serve を使っていても、ぶつかりません**。既定の `https://<PC名>.ts.net/`（443 番）の設定には触れないためです。設定する前に現在の設定を読み、同じポートを別の転送先が使っていれば、上書きせずに止まります（その場合は `server.port` を変えてください）。
 - ccsmoni 自体は `127.0.0.1` にだけ bind します。
 - ccsmoni には認証がありません。**自分だけの tailnet での利用を前提**にしています。tailnet を他の人と共有している場合は、Tailscale の ACL で、この PC へのアクセスを制限してください。
 - `*.ts.net` 以外の名前（MagicDNS の短い名前など）で開く場合は、`server.allowed_hosts` に追加してください。許可していない Host からのリクエストは拒否します（DNS rebinding 対策）。

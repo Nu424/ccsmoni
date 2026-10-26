@@ -272,9 +272,9 @@ enabled = true
 | フロント | ビルド不要の HTML/CSS/JS + uPlot（同梱） | ページ2枚の規模に見合う。時系列のグラフが軽くて速い |
 | タイムゾーン | zoneinfo + tzdata | Windows には IANA のデータベースがないため |
 | 起動 | `ccsmoni.bat` | 下記 |
-| 公開 | `tailscale serve --bg <port>`（初回だけ設定すれば保持される） | アプリは 127.0.0.1 にだけ bind する |
+| 公開 | `tailscale serve --bg --https=<port> http://127.0.0.1:<port>`（専用の HTTPS ポート。443 の既存の公開設定と共存できる。初回だけ設定すれば保持される） | アプリは 127.0.0.1 にだけ bind する |
 
-**`ccsmoni.bat` の動作**: 毎回 `uv run --project <bat の場所> ccsmoni serve` を呼ぶだけ。判定は serve 側が行う: ① 設定のポートの `GET /api/health` が ccsmoni なら、ブラウザを開いて終了する。別のサービスがポートを使っていれば、その旨を出して終了する。② 起動していなければ常駐し、準備ができたらブラウザを開く。ウィンドウは開いたままにする（閉じれば止まる。わかりやすさを優先）。③ 初回だけ `--setup-tailscale` で `ccsmoni tailscale-setup`（設定のポートで `tailscale serve --bg <port>` を実行し、status を表示）を呼ぶ。設定ファイルに誤りがあれば、serve はどのファイルのどの項目かを日本語で出して終了コード 2 で止まる。
+**`ccsmoni.bat` の動作**: 毎回 `uv run --project <bat の場所> ccsmoni serve` を呼ぶだけ。判定は serve 側が行う: ① 設定のポートの `GET /api/health` が ccsmoni なら、ブラウザを開いて終了する。別のサービスがポートを使っていれば、その旨を出して終了する。② 起動していなければ常駐し、準備ができたらブラウザを開く。ウィンドウは開いたままにする（閉じれば止まる。わかりやすさを優先）。③ 初回だけ `--setup-tailscale` で `ccsmoni tailscale-setup`（設定のポートを専用の HTTPS ポートとして `tailscale serve --bg --https=<port>` で公開する。既存の設定を読み、同じポートが別の転送先に使われていれば上書きせずに止める）を呼ぶ。設定ファイルに誤りがあれば、serve はどのファイルのどの項目かを日本語で出して終了コード 2 で止まる。
 
 **最低限の防御**: すべてのリクエストで Host ヘッダーを許可リスト（ループバック・`*.ts.net`・`server.allowed_hosts`）と照合する（DNS rebinding 対策）。POST/PUT は Origin も確認する（許可リストにあり、かつ Host と一致すること。`X-Forwarded-Host` は信頼しない）。設定から起動できるのは `claude` 本体だけにし、その設定（と host・port）は Web から変えられないようにする（任意のコマンドは実行させない）。読み取り API には認証を付けない（個人用の tailnet 内だけに公開する前提）。
 

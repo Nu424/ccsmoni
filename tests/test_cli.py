@@ -85,13 +85,35 @@ def test_tailscale_setup_uses_configured_port(home, capsys, monkeypatch):
     (home / "config.toml").write_text("[server]\nport = 8999\n", encoding="utf-8")
     monkeypatch.setattr("shutil.which", lambda name: "C:/fake/tailscale.exe" if name == "tailscale" else None)
     calls: list[list[str]] = []
+    # 別のアプリが既定の https（443）の / を使っている状態
+    status = {"Web": {"pc.example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}}}
 
-    def run(args, check=False):
+    def run(args, check=False, capture_output=False, text=False):
         calls.append(args)
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(status))
 
+    exe = "C:/fake/tailscale.exe"
     assert cli._cmd_tailscale_setup(SimpleNamespace(), run=run) == 0
-    assert calls == [["C:/fake/tailscale.exe", "serve", "--bg", "8999"], ["C:/fake/tailscale.exe", "serve", "status"]]
+    # 443 の / には触れず、専用の HTTPS ポートで公開する
+    assert calls == [
+        [exe, "serve", "status", "--json"],
+        [exe, "serve", "--bg", "--https=8999", "http://127.0.0.1:8999"],
+        [exe, "serve", "status"],
+    ]
+
+    # 設定済みなら何もしない
+    calls.clear()
+    status["Web"]["pc.example.ts.net:8999"] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8999"}}}
+    assert cli._cmd_tailscale_setup(SimpleNamespace(), run=run) == 0
+    assert calls == [[exe, "serve", "status", "--json"]]
+    assert "すでに設定済みです: https://pc.example.ts.net:8999/" in capsys.readouterr().out
+
+    # 同じポートを別の転送先が使っていたら、上書きせずに止める
+    calls.clear()
+    status["Web"]["pc.example.ts.net:8999"] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}}
+    assert cli._cmd_tailscale_setup(SimpleNamespace(), run=run) == 1
+    assert calls == [[exe, "serve", "status", "--json"]]
+    assert "上書きしない" in capsys.readouterr().err
 
     monkeypatch.setattr("shutil.which", lambda name: None)
     assert cli._cmd_tailscale_setup(SimpleNamespace(), run=run) == 1

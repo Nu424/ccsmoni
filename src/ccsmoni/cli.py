@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reparse", help="保存済みの raw をパーサーで読み直し、DB の解釈結果を作り直す")
     sub.add_parser(
         "tailscale-setup",
-        help="tailnet 内（スマホなど）に公開する設定を行う（tailscale serve --bg <設定のポート>。初回だけでよい）",
+        help="tailnet 内（スマホなど）に公開する設定を行う（専用の HTTPS ポートで tailscale serve。既存の公開設定には触れない。初回だけでよい）",
     )
     demo = sub.add_parser("demo", help="架空の 4 アカウントの設定と 30 日分の合成履歴を作る（UI の確認用）")
     demo.add_argument("--home", required=True, help="作成先のディレクトリ（serve するときは CCSMONI_HOME にこれを指定）")
@@ -255,7 +255,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_tailscale_setup(args: argparse.Namespace, run=None) -> int:
-    """設定のポートを tailscale serve で tailnet 内に公開し、状態を表示する。設定は tailscale 側に保持される。"""
+    """設定のポートを tailscale serve で tailnet 内に公開し、状態を表示する。設定は tailscale 側に保持される。
+
+    方針: 既定の https（443 番）の「/」は、同じ PC の別のアプリがすでに使っていることがある。上書きして壊さないよう、
+    ccsmoni は**専用の HTTPS ポート**（ローカルと同じ番号。例 https://<PC>.ts.net:8484/）で公開する。
+    パス（/ccsmoni など）で同居させる方式は、アプリ側をサブパス対応にする必要があるので採らない。
+    設定する前に現在の serve の設定を読み、そのポートを別の転送先が使っていれば、何もせずに止める。
+    """
+    import json
     import shutil
     import subprocess
 
@@ -265,8 +272,30 @@ def _cmd_tailscale_setup(args: argparse.Namespace, run=None) -> int:
     if exe is None:
         print("tailscale が見つかりません。Tailscale をインストールしてから、もう一度実行してください", file=sys.stderr)
         return 1
-    print(f"tailscale serve --bg {port} を設定します")
-    r = run([exe, "serve", "--bg", str(port)], check=False)
+
+    target = f"http://127.0.0.1:{port}"
+    st = run([exe, "serve", "status", "--json"], check=False, capture_output=True, text=True)
+    try:
+        web = (json.loads(st.stdout or "{}") or {}).get("Web") or {}
+    except json.JSONDecodeError:
+        web = {}
+    # 例: {"pc.tailnet.ts.net:8484": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8484"}}}}
+    for hostport, conf in web.items():
+        if not hostport.endswith(f":{port}"):
+            continue
+        proxies = {h.get("Proxy") for h in (conf.get("Handlers") or {}).values()}
+        if proxies == {target}:
+            print(f"すでに設定済みです: https://{hostport.removesuffix(':443')}/")
+            return 0
+        print(
+            f"HTTPS ポート {port} は、tailscale serve の別の設定がすでに使っています（{', '.join(sorted(p for p in proxies if p))}）。\n"
+            "上書きしないので、設定ファイルの server.port を別の番号に変えてから、もう一度実行してください",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"tailscale serve --bg --https={port} {target} を設定します（既存の公開設定には触れません）")
+    r = run([exe, "serve", "--bg", f"--https={port}", target], check=False)
     if r.returncode != 0:
         print("tailscale serve の設定に失敗しました。上のメッセージを確認してください", file=sys.stderr)
         return 1
