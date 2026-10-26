@@ -13,6 +13,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+# ---------------------------------------------------------------- 利用枠（window）の識別の規則（PLAN §4.2）
+# 保存（store）と分析（insights）の両方が使うので、ここに1か所だけ置く。
+
+# 同じ枠とみなす resets_at の許容幅。表示の丸めで 4:20am ↔ 4:19am と揺れるのを吸収する。
+WINDOW_TOLERANCE_SEC = 15 * 60
+# resets_at が同じでも、直前の値からこれだけ（ポイント）以上下がったら、新しい枠とみなす。
+# リセット直後に同じ時刻の表示が続く場合や、丸めの揺れで resets_at が許容幅に入ってしまう場合でも、リセットを取りこぼさないため。
+WINDOW_DROP_POINTS = 10.0
+
 
 class Status(StrEnum):
     """1回の取得結果の状態。"""

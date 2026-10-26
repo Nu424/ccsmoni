@@ -9,7 +9,8 @@
   - シェルは介さず引数配列で起動する。起動できるのは設定の claude 本体だけ。
   - 監視は asyncio のタスク。auth status の実行（0.3 秒程度のブロッキング）は to_thread。
   - 同じアカウントで二重に起動しない（監視中なら今の状態を返すだけ）。
-  - 完了したら store の account_meta.last_org_id と orgId を比べ、違えば mismatch。どちらでも再取得を依頼する。
+  - 完了したら store の account_meta.last_org_id と orgId を比べ、違えば mismatch。どちらでも再取得を依頼する
+    （取得中なら、その取得が終わったあとにもう一度。ログイン前の状態で取った結果のままにしないため）。
   - Popen・auth status・時計は注入できる（テストでは偽物を使い、実際にウィンドウを開かない）。
 """
 
@@ -51,7 +52,13 @@ class LoginState:
     proc: Any = field(default=None, repr=False)
 
     def to_api(self) -> dict[str, Any]:
-        return {"state": self.state, "started_at": int(self.started_at), "message": self.message}
+        return {
+            "state": self.state,
+            "started_at": int(self.started_at),
+            # 終わった（完了・失敗・タイムアウトを確かめた）時刻。waiting の間は None
+            "finished_at": int(self.finished_at) if self.finished_at is not None else None,
+            "message": self.message,
+        }
 
 
 class LoginService:
@@ -70,7 +77,7 @@ class LoginService:
         command: claude 本体の起動コマンド（例: ["C:\\...\\claude.exe"]）を返す関数。設定の変更に追従するため関数にする。
         auth_status: CliUsageSource.auth_status と同じ形（loggedIn / orgId を含む dict、読めなければ None）。
         last_org_id: アカウント id → 前回ログインしていたときの orgId（store の account_meta）。
-        on_logged_in: ログイン完了時に呼ぶ（Scheduler.refresh）。
+        on_logged_in: ログイン完了時に呼ぶ（Scheduler.refresh_soon。取得中でも、終わったあとに必ず取り直される）。
         """
         self.command = command
         self.auth_status = auth_status

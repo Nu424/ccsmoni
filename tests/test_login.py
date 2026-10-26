@@ -145,3 +145,80 @@ def test_popen_failure_is_failed():
 
 def test_state_none_when_never_started():
     assert Harness().svc.state("acct-a") is None
+
+
+def test_finished_at_is_set_when_done():
+    async def main():
+        h = Harness()
+        s = h.svc.start(ACCOUNT)
+        assert s["finished_at"] is None  # 待っている間は None
+        h.t = 1042.0
+        h.status = {"loggedIn": True, "orgId": "org-1"}
+        s = await wait_state(h, "done")
+        assert s["finished_at"] == 1042 and s["started_at"] == 1000
+
+    asyncio.run(main())
+
+
+def test_login_completion_refetches_even_while_collecting():
+    """ログインの完了時に取得中でも、その取得が終わったあとに必ず取り直す（Scheduler.refresh_soon）。"""
+    import threading
+
+    from ccsmoni.config import AppConfig
+    from ccsmoni.model import RawResult
+    from ccsmoni.probes.base import Probe
+    from ccsmoni.scheduler import Scheduler
+
+    from ccsmoni.model import Limit, Reading, Status
+
+    class FakeParser:
+        def parse(self, raw, account_id):
+            return Reading(account_id, raw.started_at, "fake", Status.OK, (Limit("session", "s", 10.0, None),))
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.saved: list = []
+
+        def save(self, raw, reading):
+            self.saved.append(reading)
+
+    async def until(cond) -> None:
+        for _ in range(1000):
+            if cond():
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError("条件を満たしませんでした")
+
+    class GatedSource:
+        kind = "fake"
+
+        def __init__(self) -> None:
+            self.gate = threading.Event()
+            self.calls = 0
+
+        def fetch(self, account):
+            from datetime import UTC, datetime
+
+            self.calls += 1
+            self.gate.wait(5)
+            return RawResult("fake", datetime.now(UTC), 1, "10")
+
+    async def main():
+        src, store = GatedSource(), FakeStore()
+        cfg = AppConfig.model_validate({"collector": {"discover_roots": []},
+                                        "accounts": [{"id": "acct-a", "label": "A", "config_dir": "/x/acct-a"}]})
+        sched = Scheduler(store, cfg, lambda c: Probe("fake", src, FakeParser()), clock=lambda: 1000.0, max_sleep=0.01)
+        task = asyncio.create_task(sched.run())
+        await until(lambda: src.calls == 1)  # ログイン前の状態で取得中
+        h = Harness()
+        h.svc.on_logged_in = sched.refresh_soon
+        h.svc.start(ACCOUNT)
+        h.status = {"loggedIn": True, "orgId": "org-1"}
+        await wait_state(h, "done")
+        src.gate.set()
+        await until(lambda: len(store.saved) == 2)  # 時計を進めなくても、すぐもう一度取る
+        assert src.calls == 2
+        await sched.stop()
+        task.cancel()
+
+    asyncio.run(main())

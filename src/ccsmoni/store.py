@@ -20,11 +20,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ccsmoni.model import Limit, RawResult, Reading, Status
+from ccsmoni.model import WINDOW_DROP_POINTS, WINDOW_TOLERANCE_SEC, Limit, RawResult, Reading, Status
 from ccsmoni.probes.base import Parser
-
-# 枠の同一判定の許容幅。表示の丸めで 4:20am ↔ 4:19am と揺れるのを吸収する（PLAN §4.2）。
-WINDOW_TOLERANCE_SEC = 15 * 60
 
 # user_version ごとのマイグレーション。キー = 移行先の版。
 _MIGRATIONS: dict[int, str] = {
@@ -195,8 +192,10 @@ class Store:
     ) -> int:
         """枠の識別（PLAN §4.2）。
 
-        同じ (account, kind) の直近の window と resets_at が ±15分以内なら同じ枠として更新し、
-        そうでなければ新しい枠を作る。taken_at 昇順に呼ばれる限り結果は決定的（reparse も同じ）。
+        同じ (account, kind) の直近の window と resets_at が ±15分以内で、かつ直前の値から
+        WINDOW_DROP_POINTS 以上下がっていなければ、同じ枠として更新する。そうでなければ新しい枠を作る。
+        「直前の値」は同じ (account, kind) の最後の limits 行（この行を挿入する前に引くので、今回の値は含まない）。
+        taken_at 昇順に呼ばれる限り結果は決定的（reparse も同じ）。
         """
         row = self._conn.execute(
             """
@@ -206,7 +205,20 @@ class Store:
             """,
             (account_id, kind),
         ).fetchone()
-        if row is not None and abs(row["resets_at"] - resets_at) <= WINDOW_TOLERANCE_SEC:
+        same = row is not None and abs(row["resets_at"] - resets_at) <= WINDOW_TOLERANCE_SEC
+        if same:
+            prev = self._conn.execute(
+                """
+                SELECT percent FROM limits
+                WHERE account_id = ? AND kind = ? AND taken_at <= ?
+                ORDER BY taken_at DESC, rowid DESC LIMIT 1
+                """,
+                (account_id, kind, taken_at),
+            ).fetchone()
+            if prev is not None and prev["percent"] - percent >= WINDOW_DROP_POINTS:
+                same = False  # resets_at は同じに見えるが、使用率が大きく下がった = リセットされた
+        if same:
+            assert row is not None
             self._conn.execute(
                 """
                 UPDATE windows
@@ -361,6 +373,12 @@ class Store:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def account_ids(self) -> list[str]:
+        """履歴（snapshot）があるアカウント id の一覧（昇順）。設定から消したアカウントの「アーカイブ」表示に使う。"""
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT account_id FROM snapshots ORDER BY account_id").fetchall()
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------ account_meta
 

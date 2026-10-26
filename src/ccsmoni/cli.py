@@ -22,6 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--config-dir", action="append", help="CLAUDE_CONFIG_DIR（複数指定可。id はディレクトリ名）。省略時は設定の有効なアカウント")
     collect.add_argument("--save", action="store_true", help="結果を DB に保存する")
     sub.add_parser("reparse", help="保存済みの raw をパーサーで読み直し、DB の解釈結果を作り直す")
+    sub.add_parser(
+        "tailscale-setup",
+        help="tailnet 内（スマホなど）に公開する設定を行う（tailscale serve --bg <設定のポート>。初回だけでよい）",
+    )
     demo = sub.add_parser("demo", help="架空の 4 アカウントの設定と 30 日分の合成履歴を作る（UI の確認用）")
     demo.add_argument("--home", required=True, help="作成先のディレクトリ（serve するときは CCSMONI_HOME にこれを指定）")
     demo.add_argument("--days", type=float, default=30, help="履歴の日数（既定 30。小数も可: 0.05 ≒ 1 時間。記録を始めたばかりの画面の確認用）")
@@ -29,12 +33,41 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# 設定ファイルの誤りで止めるときの終了コード（bat などから区別できるように、一般の失敗 1 と分ける）
+EXIT_CONFIG_ERROR = 2
+
+
+class _ConfigExit(Exception):
+    """設定ファイルの誤りで止める（メッセージは表示済み）。"""
+
+
+def _print_config_error(path, e) -> None:
+    """設定ファイルの誤りを、トレースバックではなく日本語で表示する（どのファイルの、どの項目か）。"""
+    print(f"設定ファイルに誤りがあるため、起動できません: {path}", file=sys.stderr)
+    for field, msg in e.errors:
+        print(f"  - {field}: {msg}", file=sys.stderr)
+    print("設定ファイルを直してから、もう一度実行してください", file=sys.stderr)
+
+
+def _load_config(service=None):
+    """設定を読み込む（無ければ作る）。誤りがあればメッセージを表示して _ConfigExit。"""
+    from ccsmoni.config import ConfigService, ConfigValidationError, config_path
+
+    cs = service or ConfigService(config_path())
+    try:
+        cs.load()
+    except ConfigValidationError as e:
+        _print_config_error(cs.path, e)
+        raise _ConfigExit() from e
+    return cs
+
+
 def _cmd_collect(args: argparse.Namespace) -> int:
     # --config-dir を指定したらそのディレクトリ（id はディレクトリ名）、省略したら設定の有効なアカウントを取得する。
     # 並列にはせず順に取得する（認証まわりの競合を避けるため）。
     from pathlib import Path
 
-    from ccsmoni.config import AppConfig, ConfigService, config_path, db_path
+    from ccsmoni.config import AppConfig, config_path, db_path
     from ccsmoni.model import Account
     from ccsmoni.scheduler import default_probe_factory
 
@@ -42,7 +75,7 @@ def _cmd_collect(args: argparse.Namespace) -> int:
     if args.config_dir and not config_path().exists():
         cfg = AppConfig()
     else:
-        cfg, _ = ConfigService(config_path()).load()
+        cfg = _load_config().current
     probe = default_probe_factory(cfg)
     if args.config_dir:
         accounts = []
@@ -136,8 +169,28 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
+def _probe_running(port: int, timeout: float = 2.0) -> str:
+    """そのポートで何が動いているかを調べる。"ccsmoni" / "other"（別のサービス）/ "none"（何も動いていない）。
+
+    GET /api/health が {"app": "ccsmoni"} を返したときだけ ccsmoni とみなす（ポートが開いているだけでは判断しない）。
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    if not _port_open("127.0.0.1", port):
+        return "none"
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return "other"
+    return "ccsmoni" if isinstance(data, dict) and data.get("app") == "ccsmoni" else "other"
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
-    # 準備ができたら（ポートに接続できたら）既定のブラウザで開く。すでに起動していれば、開くだけで終わる。
+    # すでに ccsmoni が起動していれば、ブラウザで開くだけで終わる（ccsmoni.bat は毎回これを呼ぶ）。
+    # 起動していなければ常駐し、準備ができたら（ポートに接続できたら）既定のブラウザで開く。
     import logging
     import threading
     import time
@@ -161,17 +214,26 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             )
             return 1
 
-    services = build_services(demo=args.demo)
-    cfg = services.config_service.current
+    app_home().mkdir(parents=True, exist_ok=True)
+    cs = _load_config()
+    cfg = cs.current
     host = cfg.server.host
     port = args.port or cfg.server.port
     url = f"http://127.0.0.1:{port}"
-    if _port_open("127.0.0.1", port):
+    running = _probe_running(port)
+    if running == "ccsmoni":
         print(f"すでに起動しています: {url}")
         if not args.no_browser:
             webbrowser.open(url)
-        services.store.close()
         return 0
+    if running == "other":
+        print(
+            f"ポート {port} は別のサービスが使っています。設定ファイルの server.port を変えてください（{cs.path}）",
+            file=sys.stderr,
+        )
+        return 1
+
+    services = build_services(demo=args.demo, config_service=cs)
 
     def open_when_ready() -> None:
         for _ in range(120):
@@ -183,11 +245,33 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if not args.no_browser:
         threading.Thread(target=open_when_ready, daemon=True).start()
     print(f"ccsmoni を起動します: {url}" + ("（デモ）" if args.demo else ""), flush=True)
+    print("このウィンドウを閉じると止まります", flush=True)
     app = create_app(services)
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
     finally:
         services.store.close()
+    return 0
+
+
+def _cmd_tailscale_setup(args: argparse.Namespace, run=None) -> int:
+    """設定のポートを tailscale serve で tailnet 内に公開し、状態を表示する。設定は tailscale 側に保持される。"""
+    import shutil
+    import subprocess
+
+    run = run or subprocess.run
+    port = _load_config().current.server.port
+    exe = shutil.which("tailscale")
+    if exe is None:
+        print("tailscale が見つかりません。Tailscale をインストールしてから、もう一度実行してください", file=sys.stderr)
+        return 1
+    print(f"tailscale serve --bg {port} を設定します")
+    r = run([exe, "serve", "--bg", str(port)], check=False)
+    if r.returncode != 0:
+        print("tailscale serve の設定に失敗しました。上のメッセージを確認してください", file=sys.stderr)
+        return 1
+    print()
+    run([exe, "serve", "status"], check=False)
     return 0
 
 
@@ -221,18 +305,21 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
-    if args.command == "parse":
-        return _cmd_parse(args)
-    if args.command == "collect":
-        return _cmd_collect(args)
-    if args.command == "reparse":
-        return _cmd_reparse(args)
-    if args.command == "demo":
-        return _cmd_demo(args)
-    if args.command == "serve":
-        return _cmd_serve(args)
-    print(f"'{args.command}' は未実装です", file=sys.stderr)
-    return 1
+    commands = {
+        "parse": _cmd_parse,
+        "collect": _cmd_collect,
+        "reparse": _cmd_reparse,
+        "demo": _cmd_demo,
+        "serve": _cmd_serve,
+        "tailscale-setup": _cmd_tailscale_setup,
+    }
+    if args.command not in commands:
+        print(f"'{args.command}' は未実装です", file=sys.stderr)
+        return 1
+    try:
+        return commands[args.command](args)
+    except _ConfigExit:
+        return EXIT_CONFIG_ERROR
 
 
 if __name__ == "__main__":

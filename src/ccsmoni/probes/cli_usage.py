@@ -6,6 +6,7 @@
       /usage はローカルで処理されモデルは呼ばれない（料金 0）。トークンには一切触れない。
 方針: シェルを介さず引数配列で起動する（Git Bash 等を経由すると /usage がパスに書き換わるため）。
       環境変数は子プロセスにだけ渡す。タイムアウト時はプロセスツリーごと終了させる。
+      timeout_seconds は1回の取得全体の締め切り（各プロセスには残り時間を渡す）。
       例外は外に投げず、失敗は RawResult.error / timed_out で返す。
 """
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -24,8 +26,18 @@ from typing import Any
 
 from ccsmoni.model import Account, RawResult
 
-# auth status の結果のうち meta に残してよいキー。メールアドレスなど個人情報は残さない。
-_AUTH_KEEP_KEYS = ("loggedIn", "authMethod", "subscriptionType", "orgId", "orgName")
+# auth status の結果のうち meta に残してよいキー。メールアドレスや組織名など、人や組織が特定できるものは残さない
+# （orgId はログイン後の「前と同じアカウントか」の照合に使うので残す）。
+_AUTH_KEEP_KEYS = ("loggedIn", "authMethod", "subscriptionType", "orgId")
+
+# auth status の出力が JSON として読めなかったとき、meta["auth_error"] に残す先頭の文字数
+AUTH_ERROR_HEAD = 200
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _mask_emails(text: str) -> str:
+    """メールアドレス風の文字列を伏せる（ログや DB に個人情報を残さないため）。"""
+    return _EMAIL_RE.sub("<email>", text)
 
 
 @dataclass
@@ -65,11 +77,14 @@ class CliUsageSource:
     kind = "cli-usage"
 
     # CLI のバージョンは毎回呼ぶと遅いので、プロセス内で共有してキャッシュする（コマンドごと）。
-    _version_cache: dict[tuple[str, ...], str | None] = {}
+    # 値は (バージョン, キャッシュの期限 = time.monotonic())。claude は自動更新されるので1時間で切れるようにする。
+    # 取得に失敗した（None）ときはキャッシュしない（次の取得でもう一度試す）。
+    _version_cache: dict[tuple[str, ...], tuple[str, float]] = {}
+    VERSION_TTL_SECONDS = 3600.0
 
     def __init__(self, claude_path: str | list[str] = "claude", timeout_seconds: float = 30) -> None:
         self.claude_path = claude_path
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = timeout_seconds  # 1回の取得（auth status + /usage）全体の締め切り
 
     # ---- 起動まわり ----
 
@@ -79,7 +94,11 @@ class CliUsageSource:
             return [shutil.which(self.claude_path) or self.claude_path]
         return list(self.claude_path)
 
-    def _run(self, args: list[str], config_dir: str | None) -> _Run:
+    def _run(self, args: list[str], config_dir: str | None, timeout: float | None = None) -> _Run:
+        """子プロセスを1つ実行する。timeout は残り時間（秒）。省略すると timeout_seconds。0 以下なら起動しない。"""
+        timeout = self.timeout_seconds if timeout is None else timeout
+        if timeout <= 0:
+            return _Run(timed_out=True)  # 締め切りを過ぎている
         cmd = self._base_command() + args
         env = os.environ.copy()  # グローバルの os.environ は変更しない
         if config_dir is not None:
@@ -104,7 +123,7 @@ class CliUsageSource:
         except Exception as e:  # 見つからない・権限なしなど
             return _Run(error=f"{type(e).__name__}: {e}")
         try:
-            out, err = proc.communicate(timeout=self.timeout_seconds)
+            out, err = proc.communicate(timeout=timeout)
             return _Run(stdout=out or "", stderr=err or "", exit_code=proc.returncode)
         except subprocess.TimeoutExpired:
             _kill_tree(proc)
@@ -117,18 +136,27 @@ class CliUsageSource:
             _kill_tree(proc)
             return _Run(error=f"{type(e).__name__}: {e}")
 
-    def _cli_version(self) -> str | None:
+    def _cli_version(self, timeout: float | None = None) -> str | None:
         key = tuple(self._base_command())
-        if key not in CliUsageSource._version_cache:
-            r = self._run(["--version"], None)
-            CliUsageSource._version_cache[key] = r.stdout.strip() or None if r.exit_code == 0 else None
-        return CliUsageSource._version_cache[key]
+        now = time.monotonic()
+        hit = CliUsageSource._version_cache.get(key)
+        if hit is not None and hit[1] > now:
+            return hit[0]
+        r = self._run(["--version"], None, timeout)
+        version = (r.stdout.strip() or None) if r.exit_code == 0 else None
+        if version is not None:
+            CliUsageSource._version_cache[key] = (version, now + self.VERSION_TTL_SECONDS)
+        else:
+            CliUsageSource._version_cache.pop(key, None)
+        return version
 
     # ---- ログイン状態 ----
 
-    def _auth(self, config_dir: str) -> tuple[_Run, dict[str, Any] | None, str | None]:
+    def _auth(
+        self, config_dir: str, timeout: float | None = None
+    ) -> tuple[_Run, dict[str, Any] | None, str | None]:
         """`claude auth status --json` を実行する。戻り値は (実行結果, 残してよいキーだけの dict, 読めなかった理由)。"""
-        r = self._run(["auth", "status", "--json"], config_dir)
+        r = self._run(["auth", "status", "--json"], config_dir, timeout)
         if r.error or r.timed_out:
             return r, None, r.error or "auth status がタイムアウトしました"
         try:
@@ -149,12 +177,21 @@ class CliUsageSource:
     # ---- 取得 ----
 
     def fetch(self, account: Account) -> RawResult:
+        """1回の取得。timeout_seconds は auth status と /usage を合わせた全体の締め切り。
+
+        締め切りは開始時に決め、各プロセスには残り時間だけを渡す（auth status が遅いと、その分 /usage の持ち時間が減る）。
+        タイムアウト・起動失敗のときは --version を呼ばない（同じ理由で失敗し、待ち時間を延ばすだけなので）。
+        """
         started_at = datetime.now(UTC)
         t0 = time.monotonic()
+        deadline = t0 + self.timeout_seconds
         meta: dict[str, Any] = {}
 
-        def done(text: str = "", **kw: Any) -> RawResult:
-            meta["cli_version"] = self._cli_version()
+        def remaining() -> float:
+            return deadline - time.monotonic()
+
+        def done(text: str = "", with_version: bool = True, **kw: Any) -> RawResult:
+            meta["cli_version"] = self._cli_version(remaining()) if with_version else None
             return RawResult(
                 source=self.kind,
                 started_at=started_at,
@@ -167,12 +204,14 @@ class CliUsageSource:
         config_dir = str(account.config_dir)
 
         # 1. ログイン状態。ログイン切れでも exit 1 + JSON なので、終了コードでなく中身を見る。
-        auth, auth_json, auth_error = self._auth(config_dir)
+        auth, auth_json, auth_error = self._auth(config_dir, remaining())
         if auth.error or auth.timed_out:
-            return done(exit_code=auth.exit_code, timed_out=auth.timed_out, error=auth.error)
+            return done(with_version=False, exit_code=auth.exit_code, timed_out=auth.timed_out, error=auth.error)
         if auth_json is None:
-            meta["auth_error"] = auth_error
-            return done(text=auth.stdout, exit_code=auth.exit_code, error=auth_error)
+            # 読めなかった出力は raw に保存しない（メールアドレスなどが含まれうる）。
+            # 原因の手がかりとして、メールアドレス風の文字列を伏せた先頭だけを meta に残す
+            meta["auth_error"] = _mask_emails(auth.stdout)[:AUTH_ERROR_HEAD]
+            return done(text="", exit_code=auth.exit_code, error=auth_error)
         meta["auth"] = auth_json
 
         # 2. ログイン切れなら /usage は実行しない（実行するとコスト表示になり紛らわしい）。
@@ -181,10 +220,10 @@ class CliUsageSource:
 
         # 3. /usage。文字列 "/usage" をそのまま引数に渡す。--bare は認証が読まれなくなるので使わない。
         usage = self._run(
-            ["-p", "/usage", "--output-format", "json", "--no-session-persistence"], config_dir
+            ["-p", "/usage", "--output-format", "json", "--no-session-persistence"], config_dir, remaining()
         )
         if usage.error or usage.timed_out:
-            return done(exit_code=usage.exit_code, timed_out=usage.timed_out, error=usage.error)
+            return done(with_version=False, exit_code=usage.exit_code, timed_out=usage.timed_out, error=usage.error)
 
         text = usage.stdout
         try:

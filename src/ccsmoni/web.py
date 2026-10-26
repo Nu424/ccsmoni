@@ -7,7 +7,12 @@
   - 部品（ConfigService・Store・Scheduler・LoginService・Probe の作り方）は Services にまとめて注入する。
     テストでは偽物を渡し、background=False で定期処理を止められる。
   - レスポンスの形は docs/API.md が契約。時刻は epoch 秒（UTC）。エラーは {"error": "<日本語>"}。
-  - POST/PUT は Origin を確認する（無い・Host と同じなら許可。tailnet 内の別ページから叩かれないように）。
+  - すべてのリクエストで Host ヘッダーを許可リスト（ループバック・*.ts.net・server.allowed_hosts）と照合する。
+    DNS rebinding（攻撃者のドメインを 127.0.0.1 に向け直して、ブラウザから読ませる）を防ぐため。
+  - POST/PUT は Origin も確認する。Origin が無い（curl など）なら許可。あれば、Origin のホストが許可リストにあり、
+    かつ Host と一致すること（tailnet 内の別ページから叩かれないように）。X-Forwarded-Host は信頼しない
+    （誰でも付けられるため。tailscale serve は Host をそのまま中継する）。
+  - 設定の claude_path・host・port は Web から変えられない（config.readonly_errors）。接続テストは同時に1件まで。
   - ログに出すのはアカウント id と状態程度（raw テキストやメールアドレスは出さない）。
 """
 
@@ -17,7 +22,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,11 +38,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ccsmoni import insights
 from ccsmoni.config import (
-    _PALETTE,
+    MSG_READONLY,
+    PALETTE,
     AppConfig,
     ConfigConflictError,
     ConfigService,
     ConfigValidationError,
+    readonly_errors,
+    readonly_values,
+    resolve_colors,
+    short_path,
 )
 from ccsmoni.model import Account, Reading, Status
 
@@ -48,6 +58,19 @@ CONFIG_POLL_SECONDS = 3.0
 CANDIDATES_REFRESH_SECONDS = 300.0  # 未登録アカウントの走査はやや重いので、たまにだけやり直す
 RANGES = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 STALE_FACTOR = 3
+# Host ヘッダーとして常に受け付けるホスト（ポートは問わない）。ほかに *.ts.net と server.allowed_hosts
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+TAILNET_SUFFIX = ".ts.net"
+APP_NAME = "ccsmoni"
+
+
+def app_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("ccsmoni")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 @dataclass
@@ -66,41 +89,53 @@ class Services:
 
 @dataclass
 class Runtime:
-    """実行中に変わる状態（いまの設定・候補・起動時の host/port）。"""
+    """実行中に変わる状態（いまの設定・候補・接続テストの実行中か）。"""
 
     services: Services
     cfg: AppConfig
     cfg_hash: str
-    server_addr: tuple[str, int]
     candidates: list[dict] = field(default_factory=list)
+    testing: bool = False  # 接続テストを実行中（同時に1件まで）
 
 
 def _err(status: int, message: str, **extra: Any) -> JSONResponse:
     return JSONResponse({"error": message, **extra}, status_code=status)
 
 
-def _short_path(p: Path) -> str:
-    """ホーム配下なら ~ を使った表記にする（画面やスクリーンショットにユーザー名を出さないため）。"""
-    try:
-        return str(Path("~") / p.resolve().relative_to(Path.home().resolve()))
-    except ValueError:
-        return str(p)
+def host_of(netloc: str) -> str:
+    """Host ヘッダー（や Origin の netloc）からポートを除いたホスト名（小文字）。IPv6 は [::1] の形のまま返す。"""
+    netloc = netloc.strip().lower()
+    if netloc.startswith("["):
+        end = netloc.find("]")
+        return netloc[: end + 1] if end != -1 else netloc
+    return netloc.rsplit(":", 1)[0].rstrip(".")
+
+
+def host_allowed(netloc: str, extra: Iterable[str] = ()) -> bool:
+    """許可リストにあるホストか（ポートは問わない）。ループバック・*.ts.net（tailscale serve 経由）・extra。"""
+    h = host_of(netloc)
+    if not h:
+        return False
+    return h in LOCAL_HOSTS or h.endswith(TAILNET_SUFFIX) or h in {x.lower() for x in extra}
 
 
 # ---------------------------------------------------------------- /api/state の組み立て
 
 
 def _api_limits(reading: Reading, now: float, rows: list[dict]) -> list[dict]:
+    taken = int(round(reading.taken_at.timestamp()))
     out = []
     for lim in reading.limits:
         d = insights.limit_to_api(lim)
-        pts = insights.window_points(rows, d["kind"], d["resets_at"]) if d["resets_at"] is not None else []
+        # この取得の行の window_id で同じ枠の点を選ぶ（resets_at が同じでも、リセット後は別の枠になるため）
+        wid = next((r.get("window_id") for r in rows if r["kind"] == d["kind"] and r["t"] == taken), None)
+        pts = insights.window_points(rows, d["kind"], d["resets_at"], wid) if d["resets_at"] is not None else []
         d["pace"] = insights.pace(d, now, pts)
         out.append(d)
     return out
 
 
-def build_account_state(rt: Runtime, index: int, a: Any, latest: dict[str, Reading], now: float) -> dict:
+def build_account_state(rt: Runtime, a: Any, color: str, latest: dict[str, Reading], now: float) -> dict:
     store, cfg = rt.services.store, rt.cfg
     interval = cfg.interval_for(a.id)
     reading = latest.get(a.id)
@@ -111,7 +146,7 @@ def build_account_state(rt: Runtime, index: int, a: Any, latest: dict[str, Readi
     st: dict[str, Any] = {
         "id": a.id,
         "label": a.label,
-        "color": a.color or _PALETTE[index % len(_PALETTE)],
+        "color": color,
         "enabled": a.enabled,
         "launch_command": a.launch_command,
         "interval_minutes": interval,
@@ -132,7 +167,7 @@ def build_account_state(rt: Runtime, index: int, a: Any, latest: dict[str, Readi
             status=str(reading.status),
             message=reading.message,
             taken_at=taken,
-            stale=now - taken > STALE_FACTOR * interval * 60,
+            stale=bool(a.enabled) and now - taken > STALE_FACTOR * interval * 60,  # 無効なアカウントは古くて当然
             plan=reading.extras.get("plan") or meta.get("last_plan"),
         )
         if reading.status == Status.OK:
@@ -145,10 +180,14 @@ def build_account_state(rt: Runtime, index: int, a: Any, latest: dict[str, Readi
     return st
 
 
-def build_state(rt: Runtime, now: float) -> dict:
+def build_state(rt: Runtime, now: float, config_hash: str | None = None) -> dict:
     sched = rt.services.scheduler
-    latest = rt.services.store.latest()
-    accounts = [build_account_state(rt, i, a, latest, now) for i, a in enumerate(rt.cfg.accounts)]
+    store = rt.services.store
+    latest = store.latest()
+    configured = {a.id for a in rt.cfg.accounts}
+    archived_ids = [aid for aid in store.account_ids() if aid not in configured]
+    colors = resolve_colors(rt.cfg.accounts, archived_ids)
+    accounts = [build_account_state(rt, a, colors[a.id], latest, now) for a in rt.cfg.accounts]
     last_run = sched.last_run_at
     if last_run is None and latest:  # 再起動直後は DB の最新値で代用する
         last_run = max(r.taken_at.timestamp() for r in latest.values())
@@ -162,7 +201,11 @@ def build_state(rt: Runtime, now: float) -> dict:
         },
         "ui": {"warn_percent": rt.cfg.ui.warn_percent, "danger_percent": rt.cfg.ui.danger_percent},
         "config_error": rt.services.config_service.last_error,
+        # いまの設定ファイルのハッシュ（壊れていても計算する）。設定画面が外部の変更に気づくのに使う
+        "config_hash": config_hash if config_hash is not None else rt.services.config_service.file_hash(),
         "accounts": accounts,
+        # 履歴はあるが設定にないアカウント（削除したもの）。推移グラフの凡例・色に使う
+        "archived": [{"id": aid, "label": aid, "color": colors[aid]} for aid in archived_ids],
         "candidates": rt.candidates,
     }
 
@@ -201,7 +244,7 @@ def create_app(
     cfg = cs.current
     if cfg is None:
         cfg, _ = cs.load()
-    rt = Runtime(services, cfg, cs.current_hash or cs.file_hash(), (cfg.server.host, cfg.server.port))
+    rt = Runtime(services, cfg, cs.current_hash or cs.file_hash())
 
     def find_candidates(c: AppConfig) -> list[dict]:
         fn = services.candidates_fn or cs.discover_candidates
@@ -265,22 +308,26 @@ def create_app(
         fields = [[".".join(str(x) for x in e["loc"]), e["msg"]] for e in exc.errors()]
         return _err(422, "入力内容に誤りがあります", fields=fields)
 
-    # --- Origin の確認 -------------------------------------------------------
+    # --- Host・Origin の確認 ------------------------------------------------
 
     @app.middleware("http")
-    async def _check_origin(request: Request, call_next):
+    async def _check_host_and_origin(request: Request, call_next):
+        host = request.headers.get("host", "")
+        if not host_allowed(host, rt.cfg.server.allowed_hosts):
+            log.warning("許可されていないホストへのリクエストを拒否しました")
+            return _err(403, "許可されていないホストへのリクエストです")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = request.headers.get("origin")
             if origin is not None:
                 o = urlsplit(origin).netloc.lower()
-                allowed = {
-                    h.lower()
-                    for h in (request.headers.get("host"), request.headers.get("x-forwarded-host"))
-                    if h
-                }
-                if not o or o not in allowed:
+                if not o or not host_allowed(o, rt.cfg.server.allowed_hosts) or o != host.strip().lower():
                     return _err(403, "許可されていないオリジンからのリクエストです")
         return await call_next(request)
+
+    @app.get("/api/health")
+    async def get_health():
+        # serve が「このポートで動いているのは ccsmoni か」を確かめるのに使う
+        return {"app": APP_NAME, "version": app_version()}
 
     # --- 状態・推移 ----------------------------------------------------------
 
@@ -288,7 +335,8 @@ def create_app(
     async def get_state():
         # Scheduler・LoginService の状態はループ内でしか触らないので、スレッドに逃がさずここで組み立てる
         # （DB の読み出しはアカウントごとに数件の小さなクエリで、数ミリ秒で終わる）
-        return build_state(rt, services.clock())
+        h = await asyncio.to_thread(cs.file_hash)
+        return build_state(rt, services.clock(), h)
 
     @app.get("/api/history")
     async def get_history(range: str = "7d", kinds: str | None = None, accounts: str | None = None):
@@ -340,15 +388,22 @@ def create_app(
 
     @app.get("/api/config")
     async def get_config():
-        # ファイルが壊れている（検証に通らない）ときは、最後に有効だった設定と「いまのファイルの hash」を返す。
-        # こうしないと UI は 409 → 読み込み直し → 409 を繰り返す。保存すれば壊れた内容を上書きして直せる
+        # ファイルが壊れている（読めない・検証に通らない・空・無い）ときは、最後に有効だった設定と
+        # 「いまのファイルの hash」を返す。有効だった設定の hash を返すと、保存のたびに 409 になるため。
+        # 保存すると直せる: 検証に通らないだけなら差分で書き直し（スキーマ外のキーは取り除く）、
+        # TOML の構文エラーなら壊れたファイルを config.toml.broken-<日時> に退避して書き出し直す（ConfigService.save）
         h = rt.cfg_hash if cs.last_error is None else await asyncio.to_thread(cs.file_hash)
+        history_ids = await asyncio.to_thread(services.store.account_ids)
         return {
             "config": rt.cfg.model_dump(),
             "hash": h,
-            "path": _short_path(cs.path),
+            "path": short_path(cs.path),
             "error": cs.last_error,
             "candidates": rt.candidates,
+            "palette": list(PALETTE),
+            "colors": resolve_colors(rt.cfg.accounts),
+            "history_ids": history_ids,
+            "readonly": readonly_values(rt.cfg),
         }
 
     @app.put("/api/config")
@@ -356,8 +411,12 @@ def create_app(
         body = await _json_body(request)
         if not isinstance(body, dict) or not isinstance(body.get("config"), dict) or not isinstance(body.get("hash"), str):
             return _err(422, "入力内容に誤りがあります", fields=[["(全体)", "config と hash を指定してください"]])
+        # claude_path・host・port はファイルでだけ編集する。省略されていれば今の値で埋める
+        locked = readonly_errors(body["config"], rt.cfg)
+        if locked:
+            return _err(422, MSG_READONLY, fields=[[f, m] for f, m in locked])
         try:
-            new_hash = await asyncio.to_thread(cs.save, body["config"], body["hash"])
+            result = await asyncio.to_thread(cs.save, body["config"], body["hash"])
         except ConfigConflictError:
             return _err(409, "設定ファイルが外部で変更されました", hash=await asyncio.to_thread(cs.file_hash))
         except ConfigValidationError as e:
@@ -365,11 +424,16 @@ def create_app(
         new_cfg = cs.current
         assert new_cfg is not None
         log.info("画面から設定を保存しました")
-        apply_config(new_cfg, new_hash)
-        out: dict[str, Any] = {"hash": new_hash}
-        if (new_cfg.server.host, new_cfg.server.port) != rt.server_addr:
-            out["restart_required"] = True
-        return out
+        if result.removed_keys:
+            log.info("設定ファイルからスキーマ外のキーを取り除きました: %s", ", ".join(result.removed_keys))
+        if result.backup_path is not None:
+            log.info("壊れた設定ファイルを退避しました: %s", short_path(result.backup_path))
+        apply_config(new_cfg, result.hash)
+        return {
+            "hash": result.hash,
+            "removed_keys": result.removed_keys,
+            "backup_path": short_path(result.backup_path) if result.backup_path is not None else None,
+        }
 
     # --- 接続テスト ----------------------------------------------------------
 
@@ -379,17 +443,23 @@ def create_app(
         config_dir = body.get("config_dir") if isinstance(body, dict) else None
         if not isinstance(config_dir, str) or not config_dir.strip():
             return _err(422, "入力内容に誤りがあります", fields=[["config_dir", "空にはできません"]])
+        # claude を起動するので、同時に1件までにする（連打や複数の画面から、プロセスが積み上がらないように）
+        if rt.testing:
+            return _err(429, "接続テストを実行中です")
         from ccsmoni.config import AccountConfig
 
         expanded = AccountConfig(id="test", label="test", config_dir=config_dir).expanded_dir()
         account = Account(id="test", label="test", config_dir=expanded)
         probe = services.probe_factory(rt.cfg)
         now = services.clock()
+        rt.testing = True
         try:
             _raw, reading = await asyncio.to_thread(probe.run, account)
         except Exception as e:
             log.error("接続テストで例外が発生しました（%s）", type(e).__name__)
             return {"status": "error", "message": f"{type(e).__name__}: {e}", "plan": None, "limits": []}
+        finally:
+            rt.testing = False
         log.info("接続テスト: %s", reading.status)
         return {
             "status": str(reading.status),
@@ -428,8 +498,12 @@ def create_app(
 # ---------------------------------------------------------------- 本番・デモの部品の組み立て
 
 
-def build_services(demo: bool = False) -> Services:
-    """CCSMONI_HOME（app_home）の設定と DB から、serve 用の部品を作る。"""
+def build_services(demo: bool = False, config_service: ConfigService | None = None) -> Services:
+    """CCSMONI_HOME（app_home）の設定と DB から、serve 用の部品を作る。
+
+    config_service を渡すと、それ（読み込み済み）を使う（serve が起動前に設定を確かめるため）。
+    設定が検証に通らなければ ConfigValidationError。
+    """
     from ccsmoni.config import app_home, config_path, db_path
     from ccsmoni.login import LoginService
     from ccsmoni.parser_usage import UsageTextParser
@@ -440,8 +514,10 @@ def build_services(demo: bool = False) -> Services:
 
     home = app_home()
     home.mkdir(parents=True, exist_ok=True)
-    cs = ConfigService(config_path())
-    cfg, _ = cs.load()
+    cs = config_service or ConfigService(config_path())
+    cfg = cs.current
+    if cfg is None:
+        cfg, _ = cs.load()
     store = Store(db_path())
 
     if demo:
@@ -457,7 +533,7 @@ def build_services(demo: bool = False) -> Services:
             command=lambda: ["claude"],
             auth_status=source.auth_status,
             last_org_id=lambda aid: (store.get_account_meta(aid) or {}).get("last_org_id"),
-            on_logged_in=lambda aid: _safe_refresh(scheduler, aid),
+            on_logged_in=scheduler.refresh_soon,
             popen=lambda args, env=None, **kw: demo_mod.DemoConsole(source, Path(env["CLAUDE_CONFIG_DIR"]).name),
             poll_seconds=2.0,
         )
@@ -477,13 +553,7 @@ def build_services(demo: bool = False) -> Services:
         command=command,
         auth_status=auth_status,
         last_org_id=lambda aid: (store.get_account_meta(aid) or {}).get("last_org_id"),
-        on_logged_in=lambda aid: _safe_refresh(scheduler, aid),
+        on_logged_in=scheduler.refresh_soon,
     )
     return Services(cs, store, scheduler, login, default_probe_factory)
 
-
-def _safe_refresh(scheduler: Any, account_id: str) -> None:
-    try:
-        scheduler.refresh(account_id)
-    except KeyError:
-        pass  # ログインの間に無効化された

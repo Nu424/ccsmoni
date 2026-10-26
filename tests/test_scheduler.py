@@ -205,3 +205,111 @@ def test_update_config_adds_removes_and_changes_interval():
         task.cancel()
 
     run(main)
+
+
+def test_refresh_soon_while_busy_fetches_again_after():
+    async def main():
+        gate = threading.Event()
+        src, clock = FakeSource(gate=gate), Clock()
+        sched, store = make(cfg("a", "b"), src, clock)
+        task = asyncio.create_task(sched.run())
+        await until(lambda: len(src.calls) == 2)
+        sched.refresh_soon("a")  # 取得中: 終わったらもう一度
+        assert sched.refresh() == []  # 普通の「今すぐ更新」は印を付けない
+        sched.refresh_soon("zzz")  # 無効な id は何もしない
+        gate.set()
+        await until(lambda: len(store.saved) == 3)
+        await settle()
+        assert sorted(src.calls) == ["a", "a", "b"] and src.calls[-1] == "a"
+        assert len(store.saved) == 3  # b はもう一度取らない
+        assert sched.next_run_at("a") == clock.t + 600
+        await sched.stop()
+        task.cancel()
+
+    run(main)
+
+
+def test_config_dir_change_while_busy_fetches_again():
+    async def main():
+        gate = threading.Event()
+        src, clock = FakeSource(gate=gate), Clock()
+        sched, store = make(cfg("a"), src, clock)
+        task = asyncio.create_task(sched.run())
+        await until(lambda: len(src.calls) == 1)
+        changed = cfg("a")
+        changed.accounts[0].config_dir = "/y/a"
+        sched.update_config(changed)  # 取得中に取得先が変わった
+        gate.set()
+        await until(lambda: len(store.saved) == 2)
+        assert src.calls == ["a", "a"]
+        await sched.stop()
+        task.cancel()
+
+    run(main)
+
+
+def test_limiter_never_exceeds_limit_across_changes():
+    from ccsmoni.scheduler import _Limiter
+
+    async def main():
+        lim = _Limiter(2)
+        log: list[str] = []
+        releases = {n: asyncio.Event() for n in "abcd"}
+
+        async def worker(n: str) -> None:
+            async with lim:
+                log.append(f"+{n}")
+                assert lim.active <= max(lim.limit, 2)
+                await releases[n].wait()
+                log.append(f"-{n}")
+
+        tasks = [asyncio.create_task(worker(n)) for n in "abcd"]
+        await until(lambda: lim.active == 2)
+        lim.set_limit(1)  # 2 件実行中に上限を 1 に下げる
+        releases["a"].set()
+        await until(lambda: "-a" in log)
+        await asyncio.sleep(0.02)
+        assert "+c" not in log and lim.active == 1  # まだ 1 件実行中なので、新しく始めない
+        releases["b"].set()
+        await until(lambda: "+c" in log)
+        assert lim.active == 1 and "+d" not in log
+        lim.set_limit(3)  # 上げると、待っていたものがすぐ始まる
+        await until(lambda: "+d" in log)
+        assert lim.active == 2
+        releases["c"].set()
+        releases["d"].set()
+        await asyncio.gather(*tasks)
+        assert lim.active == 0
+        assert [x for x in log if x.startswith("+")] == ["+a", "+b", "+c", "+d"]  # 先着順
+
+    run(main)
+
+
+def test_limiter_cancelled_waiter_does_not_leak_slot():
+    from ccsmoni.scheduler import _Limiter
+
+    async def main():
+        lim = _Limiter(1)
+        hold = asyncio.Event()
+
+        async def holder():
+            async with lim:
+                await hold.wait()
+
+        async def waiter():
+            async with lim:
+                pass
+
+        h = asyncio.create_task(holder())
+        await until(lambda: lim.active == 1)
+        w = asyncio.create_task(waiter())
+        await asyncio.sleep(0.01)
+        w.cancel()
+        await asyncio.gather(w, return_exceptions=True)
+        hold.set()
+        await h
+        assert lim.active == 0
+        async with lim:
+            assert lim.active == 1
+
+    run(main)

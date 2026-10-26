@@ -5,7 +5,10 @@
 なぜ: 常駐プロセス1つの中で、アカウントごとに違う間隔で取りたい（PLAN D4）。取得は数秒かかるブロッキング処理なので、
       イベントループを止めないように別スレッドで動かす。
 方針:
-  - asyncio の1本のループ。取得は asyncio.to_thread。同時実行数は collector.concurrency（Semaphore）。
+  - asyncio の1本のループ。取得は asyncio.to_thread。同時実行数は collector.concurrency（_Limiter）。
+    上限は実行中でも変えられる（Semaphore を作り直すと、新旧の Semaphore で合わせて上限を超えてしまうため）。
+  - 取得中に「取り直し」が求められたら（取得先の変更・ログインの完了など）、もう一度の印を付け、終わったらすぐ取り直す。
+    取得中の結果は古い前提のものなので、その後の予定（間隔）で上書きしてしまわないように。
   - 時刻は壁時計（clock、既定 time.time）で判断する。待機は最大 MAX_SLEEP 秒ずつにして、そのたびに予定と比べ直す。
     PC がスリープから復帰して予定を大きく過ぎていても、その時点で1回取得するだけ（たまった分を何回も実行しない）。
     次の予定は「取得を始めた時刻 + 間隔」。それも過ぎていれば「今 + 間隔」。
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
@@ -31,6 +35,62 @@ log = logging.getLogger("ccsmoni.scheduler")
 
 # 1回の待機の上限（秒）。スリープ復帰や時計の変更に、この時間以内に気づける
 MAX_SLEEP = 15.0
+
+
+class _Limiter:
+    """上限を後から変えられるセマフォ（待ちは先着順）。
+
+    上限を下げても、実行中のものはそのまま終わらせる（中断しない）。新しく始める分は、実行中の数が新しい上限を
+    下回るまで待つ。1つのカウンタで数えるので、変更の前後で上限を超えて新しく始めることはない。
+    set_limit は同期で呼べる（設定の反映は同期の update_config から行うため）。
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def set_limit(self, limit: int) -> None:
+        self._limit = limit
+        self._wake()  # 上限が上がったなら、待っているものを始めさせる
+
+    def _wake(self) -> None:
+        while self._waiters and self._active < self._limit:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                self._active += 1  # 起こす側で枠を確保してから渡す（起きるまでの間に横取りされないように）
+                fut.set_result(None)
+
+    async def __aenter__(self) -> None:
+        if self._active < self._limit and not self._waiters:
+            self._active += 1
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self._active -= 1  # 枠をもらった直後に取り消された。枠を返す
+                self._wake()
+            else:
+                try:
+                    self._waiters.remove(fut)
+                except ValueError:
+                    pass
+            raise
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._active -= 1
+        self._wake()
 
 
 class StoreLike(Protocol):
@@ -79,11 +139,12 @@ class Scheduler:
         self.last_run_at: float | None = None  # 最後にどれかのアカウントを取得し終えた時刻
         self._cfg = config
         self._probe = probe_factory(config)
-        self._sem = asyncio.Semaphore(config.collector.concurrency)
+        self._limiter = _Limiter(config.collector.concurrency)
         self._accounts: dict[str, Account] = {}  # 有効なアカウント（設定の並び順）
         self._next: dict[str, float] = {}  # id → 次に取得する予定の時刻
         self._started: dict[str, float] = {}  # id → 最後に取得を始めた時刻（間隔の変更の反映に使う）
-        self._tasks: dict[str, asyncio.Task] = {}  # 取得中（Semaphore 待ちを含む）
+        self._tasks: dict[str, asyncio.Task] = {}  # 取得中（同時実行数の空き待ちを含む）
+        self._again: set[str] = set()  # 取得中に取り直しを求められた id（終わったらすぐもう一度取得する）
         self._wake: asyncio.Event | None = None
         self._stopping = False
         self._apply_accounts(config, initial=True)
@@ -117,6 +178,7 @@ class Scheduler:
         for aid in list(self._next):
             if aid not in new:
                 self._next.pop(aid, None)  # 取得中のものはそのまま終わらせる（結果は保存してよい）
+                self._again.discard(aid)
         for aid, acc in new.items():
             old = self._accounts.get(aid)
             interval = cfg.interval_for(aid) * 60
@@ -124,6 +186,8 @@ class Scheduler:
                 self._next[aid] = now  # 追加されたアカウント・起動直後は、すぐに取得する
             elif old.config_dir != acc.config_dir:
                 self._next[aid] = now  # 取得先が変わったので取り直す
+                if aid in self._tasks:
+                    self._again.add(aid)  # 取得中の結果は古い取得先のもの。終わったらすぐ取り直す
             elif aid in self._started:
                 # 間隔の変更: 最後に始めた時刻から数え直す（過ぎていればすぐ）
                 self._next[aid] = self._started[aid] + interval
@@ -140,19 +204,21 @@ class Scheduler:
         ):
             self._probe = self.probe_factory(cfg)
         if old.collector.concurrency != cfg.collector.concurrency:
-            # 取得中のものは古い Semaphore のまま終わる。新しく始める分から新しい上限を使う
-            self._sem = asyncio.Semaphore(cfg.collector.concurrency)
+            # 実行中のものはそのまま終わる。新しく始める分から新しい上限で数える（同じカウンタなので超えない）
+            self._limiter.set_limit(cfg.collector.concurrency)
         self._apply_accounts(cfg)
         log.info("設定を反映しました（有効なアカウント %d 件）", len(self._accounts))
         self._poke()
 
     # ------------------------------------------------------------ 今すぐ更新
 
-    def refresh(self, account_id: str | None = None) -> list[str]:
+    def refresh(self, account_id: str | None = None, again: bool = False) -> list[str]:
         """その場で取得を始める。すでに取得中のアカウントは二重に起動しない。
 
+        again=True なら、取得中のアカウントには「もう一度」の印を付け、終わったらすぐ取り直す
+        （設定の変更・ログインの完了など、取得中の結果が古い前提になった場合）。
         戻り値は新しく始めた id。存在しない（無効な）id を指定したら KeyError。
-        イベントループの中から呼ぶこと（別スレッドからは refresh_threadsafe）。
+        イベントループの中から呼ぶこと。
         """
         if account_id is not None and account_id not in self._accounts:
             raise KeyError(account_id)
@@ -160,14 +226,17 @@ class Scheduler:
         started = [aid for aid in targets if aid not in self._tasks]
         for aid in started:
             self._spawn(aid)
+        if again:
+            self._again.update(aid for aid in targets if aid not in started)
         return started
 
-    def refresh_threadsafe(self, loop: asyncio.AbstractEventLoop, account_id: str | None = None) -> None:
-        loop.call_soon_threadsafe(lambda: self._safe_refresh(account_id))
+    def refresh_soon(self, account_id: str) -> None:
+        """取り直しを依頼する（ログインの完了時に LoginService から呼ぶ）。取得中なら終わったあとにもう一度。
 
-    def _safe_refresh(self, account_id: str | None) -> None:
+        無効な id（ログインの間に無効化・削除された）は何もしない。イベントループの中から呼ぶこと。
+        """
         try:
-            self.refresh(account_id)
+            self.refresh(account_id, again=True)
         except KeyError:
             pass
 
@@ -211,7 +280,7 @@ class Scheduler:
 
     async def _run_one(self, account_id: str) -> None:
         try:
-            async with self._sem:
+            async with self._limiter:
                 account = self._accounts.get(account_id)
                 if account is None:
                     return  # 順番待ちの間に無効化・削除された
@@ -236,6 +305,10 @@ class Scheduler:
                     self._next[account_id] = nxt if nxt > now else now + self._cfg.interval_for(account_id) * 60
         finally:
             self._tasks.pop(account_id, None)
+            if account_id in self._again:
+                self._again.discard(account_id)
+                if account_id in self._accounts and not self._stopping:
+                    self._next[account_id] = self.clock()  # すぐ取り直す（run のループが拾う）
             self._poke()
 
 

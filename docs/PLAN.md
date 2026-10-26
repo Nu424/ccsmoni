@@ -89,20 +89,20 @@
  │  Scheduler ── アカウントごとの間隔 / 今すぐ更新 / 同時実行の制限     │
  │        ▼                                                             │
  │  Probe（取得方法 = Source + Parser の組。差し替えられる）            │
- │    ├ AuthStatusSource : claude auth status --json                    │
- │    └ CliUsageSource   : claude -p /usage --output-format json …      │
+ │    └ CliUsageSource : claude auth status --json で確認 →             │
+ │                       claude -p /usage --output-format json …        │
  │        ▼ RawResult（raw テキスト・終了コード・所要時間）             │
  │    UsageTextParser（純粋関数）→ Reading                              │
  │        ▼                                                             │
- │  Store（SQLite）: snapshots（raw も保存）/ limits / account_meta     │
+ │  Store（SQLite）: snapshots（raw も保存）/ limits / windows（枠の識別）│
  │        ▼                                                             │
- │  Insights（純粋関数）: 枠の識別・ペース・「使わないと損」・週ピーク  │
+ │  Insights（純粋関数）: ペース・枯渇の予測・「使わないと損」・週ピーク│
  │        ▼                                                             │
- │  HTTP: JSON API + 静的ダッシュボード（127.0.0.1 のみ）               │
- │  LoginService: claude auth login の起動・URL の取り出し・コード入力  │
+ │  HTTP: JSON API + 静的ダッシュボード（ループバックのみ・Host を確認）│
+ │  LoginService: claude auth login のコンソールを開き、完了を監視      │
  └──────────────────────────────────────────────────────────────────────┘
         ▲ tailscale serve で tailnet 内（PC・スマホ）にだけ公開
-  ccsmoni.bat: 起動（起動済みならブラウザを開くだけ）
+  ccsmoni.bat: ccsmoni serve を呼ぶだけ（起動済みなら serve がブラウザを開いて終わる）
 ```
 
 ### 4.1 取得方法の抽象化（D1 の決定を受けて）
@@ -115,7 +115,7 @@ class Source(Protocol):            # どう取ってくるか
     def fetch(self, account: Account) -> RawResult: ...
 
 class Parser(Protocol):            # 取ってきたものをどう読むか
-    def parse(self, raw: RawResult, account: Account) -> Reading: ...
+    def parse(self, raw: RawResult, account_id: str) -> Reading: ...   # raw と id だけから作る（reparse のため）
 
 # Probe = Source + Parser の組。設定の probe = "cli-usage" で選ぶ。
 # 将来、別の取得方法を足すときは、Probe を1つ登録するだけでよい。
@@ -133,7 +133,10 @@ class Parser(Protocol):            # 取ってきたものをどう読むか
 
 ### 4.2 推移を正しく描くための工夫
 
-- **枠の識別**: `(account, kind, resets_at を最寄りの時刻に丸めた値)` を枠の ID とする。表示の丸めによる揺れを吸収する。
+- **枠の識別**: 同じ `(account, kind)` の直近の枠と `resets_at` が ±15 分以内なら同じ枠とする（表示の丸めによる揺れを吸収する）。
+  ただし `resets_at` が同じでも、直前の値から使用率が **10 ポイント以上**下がったら新しい枠とする（リセットの取りこぼしを防ぐ）。
+  許容幅とポイントは `model.py` の定数（`WINDOW_TOLERANCE_SEC`・`WINDOW_DROP_POINTS`）で、保存（store）と分析（insights）が共有する。
+  取得時刻の順に決定的に割り当てるので、`reparse` でも同じ結果になる。
 - **リセットの検出**: 使用率が下がった、または枠の ID が変わったら「リセットされた」とみなす。グラフは枠ごとに線を切り、リセットの位置に縦線を引く（ノコギリ状の5h枠が、つながった線に見えないようにする）。
 - **年の補完**: 取得時刻から見て「−1日〜+8日」の範囲に入る年を選ぶ。
 - **取得の抜けを見せる**: PC がスリープしていた間などデータがない区間は、線を補間せずに空白で示す（嘘の線を引かない）。
@@ -204,7 +207,11 @@ class Parser(Protocol):            # 取ってきたものをどう読むか
 - `ConfigService` が「読み込み → 検証（pydantic のモデル）→ 保存」を一手に引き受ける。ファイルを直接編集した場合も、UI から保存した場合も、**同じ検証を通る**。
 - 書き込みは `tomlkit` で行い、**コメントや並び順を保つ**（手で書いたメモが UI からの保存で消えない）。一時ファイルに書いてから置き換える（アトミックな書き込み）。
 - **競合の検出**: UI は読み込んだときのファイルのハッシュを持っておき、保存時に一致しなければ拒否して「外部で変更されました」と出す（楽観ロック）。
-- 変更を検知したら（ファイルの更新時刻を数秒おきに確認）、再読み込みして Scheduler に通知する。再起動はいらない。
+- 変更を検知したら（ファイルの内容のハッシュを数秒おきに確認）、再読み込みして Scheduler に通知する。再起動はいらない。
+  ファイルが壊れた・空になった・消えたときは、最後に有効だった設定で動き続け、画面に理由を出す。
+- 保存では、書き出す予定の TOML 全体を読み込みと同じ検証に通してから置き換える（既知のセクションにあるスキーマ外のキーは取り除く）。
+  TOML の構文エラーのファイルは `config.toml.broken-<日時>` に退避してから書き出し直す。
+- `collector.claude_path`・`server.host`・`server.port` はファイルでだけ編集する（UI では表示だけ。任意のコマンドの実行・外部への公開を防ぐため）。
 - アカウントの `id` は履歴のキーなので変更しない。表示名は自由に変えてよい。アカウントを削除しても履歴は残し、「アーカイブ」として扱う。
 - 却下した案: 設定を DB に持つ（正が2つになる）、TOML をそのまま編集する欄だけにする（簡単だが使いにくい）。
 
@@ -213,13 +220,16 @@ class Parser(Protocol):            # 取ってきたものをどう読むか
 ```toml
 [collector]
 default_interval_minutes = 10
-timeout_seconds = 30
+timeout_seconds = 30                  # 1回の取得（auth status + /usage）全体の締め切り
 concurrency = 2
-discover_root = "~/claude-configs"   # 未登録アカウントを探す場所
+claude_path = "claude"                # claude 本体（stem が claude のものだけ。ファイルでだけ編集する）
+discover_roots = ["~/claude-configs"] # 未登録アカウントを探す場所（複数可）
+discover_depth = 2
 
 [server]
-host = "127.0.0.1"
+host = "127.0.0.1"                    # ループバックのみ（127.0.0.1 / ::1 / localhost）
 port = 8484
+allowed_hosts = []                    # Host として受け付ける追加の名前（MagicDNS の短い名前など。*.ts.net は常に可）
 
 [ui]
 warn_percent = 70
@@ -264,9 +274,9 @@ enabled = true
 | 起動 | `ccsmoni.bat` | 下記 |
 | 公開 | `tailscale serve --bg <port>`（初回だけ設定すれば保持される） | アプリは 127.0.0.1 にだけ bind する |
 
-**`ccsmoni.bat` の動作**: ① すでにポートで起動していれば、ブラウザを開いて終了する。② 起動していなければ `uv run ccsmoni serve` を起動し、準備ができたらブラウザを開く。ウィンドウは開いたままにする（閉じれば止まる。わかりやすさを優先）。③ 初回だけ `tailscale serve` の設定を案内または実行する（`--setup-tailscale` で）。
+**`ccsmoni.bat` の動作**: 毎回 `uv run --project <bat の場所> ccsmoni serve` を呼ぶだけ。判定は serve 側が行う: ① 設定のポートの `GET /api/health` が ccsmoni なら、ブラウザを開いて終了する。別のサービスがポートを使っていれば、その旨を出して終了する。② 起動していなければ常駐し、準備ができたらブラウザを開く。ウィンドウは開いたままにする（閉じれば止まる。わかりやすさを優先）。③ 初回だけ `--setup-tailscale` で `ccsmoni tailscale-setup`（設定のポートで `tailscale serve --bg <port>` を実行し、status を表示）を呼ぶ。設定ファイルに誤りがあれば、serve はどのファイルのどの項目かを日本語で出して終了コード 2 で止まる。
 
-**最低限の防御**: POST の API は Origin を確認する（tailnet 内の別のページから勝手に叩かれないように）。設定から起動できるのは `claude` 本体だけにする（任意のコマンドは実行させない）。
+**最低限の防御**: すべてのリクエストで Host ヘッダーを許可リスト（ループバック・`*.ts.net`・`server.allowed_hosts`）と照合する（DNS rebinding 対策）。POST/PUT は Origin も確認する（許可リストにあり、かつ Host と一致すること。`X-Forwarded-Host` は信頼しない）。設定から起動できるのは `claude` 本体だけにし、その設定（と host・port）は Web から変えられないようにする（任意のコマンドは実行させない）。読み取り API には認証を付けない（個人用の tailnet 内だけに公開する前提）。
 
 ### ディレクトリ構成
 
@@ -275,17 +285,18 @@ ccsmoni/
   ccsmoni.bat
   pyproject.toml
   src/ccsmoni/
-    model.py        # Reading / Limit / RawResult / Account
-    config.py       # ConfigService（読み込み・検証・保存・変更検知・自動生成）
-    probes/         # base.py（Source/Parser/Probe）, cli_usage.py, auth_status.py
+    model.py        # Reading / Limit / RawResult / Account、枠の識別の定数
+    config.py       # ConfigService（読み込み・検証・保存・変更検知・自動生成）、色の割り当て
+    probes/         # base.py（Source/Parser/Probe）, cli_usage.py（auth status と /usage）
     parser_usage.py # /usage テキスト → Reading（純粋関数）
-    store.py        # SQLite
-    insights.py     # 枠の識別・リセット検出・ペース・ヒント・週ピーク（純粋関数）
-    scheduler.py
+    store.py        # SQLite（枠の識別を含む）
+    insights.py     # ペース・枯渇の予測・ヒント・推移の線・週ピーク（純粋関数）
+    scheduler.py    # 定期取得（アカウントごとの間隔・同時実行数・取り直し）
     login.py        # LoginService（コンソールの起動・ログイン完了の監視）
-    web.py          # API と静的配信
-    cli.py          # ccsmoni parse / collect / reparse / serve
-    static/
+    web.py          # API と静的配信（Host・Origin の確認）
+    demo.py         # 架空データの生成と serve --demo 用の偽 Source（UI の確認用）
+    cli.py          # ccsmoni parse / collect / reparse / serve / demo / tailscale-setup
+    static/         # UI（ビルド不要の HTML/CSS/JS + uPlot）
   tests/fixtures/   # 機密を除いたサンプル
   scripts/check_secrets.py
   local/            # git 管理外

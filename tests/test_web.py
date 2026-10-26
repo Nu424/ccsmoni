@@ -1,4 +1,7 @@
-"""web（FastAPI）のテスト。Scheduler・LoginService・Probe は偽物、設定と DB は tmp_path / メモリ上。"""
+"""web（FastAPI）のテスト。Scheduler・LoginService・Probe は偽物、設定と DB は tmp_path / メモリ上。
+
+TestClient の既定の Host（testserver）は Host の確認で拒否されるので、base_url を 127.0.0.1:8484 にする。
+"""
 
 from __future__ import annotations
 
@@ -14,14 +17,15 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from fastapi.testclient import TestClient
 
-from ccsmoni.config import ConfigService
+from ccsmoni.config import PALETTE, ConfigService
 from ccsmoni.model import Limit, RawResult, Reading, Status
 from ccsmoni.parser_usage import UsageTextParser
 from ccsmoni.probes.base import Probe
 from ccsmoni.store import Store
-from ccsmoni.web import Services, create_app
+from ccsmoni.web import Services, app_version, create_app, host_allowed
 
 NOW = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+BASE = "http://127.0.0.1:8484"
 CONFIG = """\
 # 手書きのメモ
 [collector]
@@ -45,6 +49,9 @@ id = "c"
 label = "C"
 config_dir = "~/x/c"
 enabled = false
+
+[server]
+allowed_hosts = ["mypc"]
 """
 
 
@@ -79,13 +86,14 @@ class FakeScheduler:
 class FakeLogin:
     def __init__(self) -> None:
         self.started: list = []
+        self.states: dict = {}
 
     def start(self, account):
         self.started.append(account)
         return {"state": "waiting", "started_at": int(NOW.timestamp()), "message": "PC 側にログイン画面を開きました"}
 
     def state(self, account_id):
-        return None
+        return self.states.get(account_id)
 
     async def stop(self):
         pass
@@ -137,7 +145,7 @@ def env(tmp_path: Path):
         clock=lambda: NOW.timestamp(),
     )
     app = create_app(services, background=False, static_dir=static)
-    with TestClient(app) as client:
+    with TestClient(app, base_url=BASE) as client:
         yield client, services, cfg_path, static
     store.close()
 
@@ -152,6 +160,9 @@ def test_state_shape(env):
         save(store, reading("a", NOW - timedelta(minutes=60 - 10 * i), session=10 + 10 * i))
     save(store, reading("b", NOW - timedelta(hours=2), weekly=20))
     save(store, reading("b", NOW - timedelta(hours=1), status=Status.LOGGED_OUT))
+    save(store, reading("c", NOW - timedelta(days=3)))  # 無効なアカウントの古い値
+    save(store, reading("old", NOW - timedelta(days=2)))  # 設定から消したアカウント
+    svc.login.states["b"] = {"state": "done", "started_at": 1, "finished_at": 2, "message": "ログインしました"}
 
     d = client.get("/api/state").json()
     assert d["now"] == int(NOW.timestamp())
@@ -181,8 +192,16 @@ def test_state_shape(env):
     assert b["interval_minutes"] == 5
     assert b["stale"] is True  # 1 時間前 > 5 分 × 3
 
-    assert c["status"] == "never" and c["enabled"] is False and c["next_run_at"] is None
-    assert c["color"].startswith("#") and c["login"] is None
+    assert b["login"]["finished_at"] == 2
+
+    assert c["status"] == "ok" and c["enabled"] is False and c["next_run_at"] is None
+    assert c["stale"] is False  # 無効なアカウントは古くても stale にしない
+    assert c["color"] == PALETTE[2] and c["login"] is None
+    assert b["color"] == PALETTE[1]  # 未設定の色は並び順でパレットから
+
+    # 設定にないが履歴はあるアカウント。色は設定のアカウントが使っていない色から
+    assert d["archived"] == [{"id": "old", "label": "old", "color": PALETTE[0]}]
+    assert d["config_hash"] == svc.config_service.file_hash()
 
 
 # ---------------------------------------------------------------- history / windows
@@ -234,13 +253,44 @@ def test_origin_check(env):
     assert r.status_code == 403 and r.json()["error"]
     r = client.put("/api/config", json={}, headers={"Origin": "http://evil.example"})
     assert r.status_code == 403
-    # Host と同じオリジンは許可（TestClient の Host は testserver）
-    assert client.post("/api/refresh", headers={"Origin": "http://testserver"}).status_code == 202
+    # Host と同じオリジンは許可
+    assert client.post("/api/refresh", headers={"Origin": BASE}).status_code == 202
     # tailscale serve 経由（https・ポートなし）でも Host が同じなら許可
     r = client.post("/api/refresh", headers={"Origin": "https://pc.example.ts.net", "Host": "pc.example.ts.net"})
     assert r.status_code == 202
-    # GET は確認しない
+    # Origin が許可リストにあっても、Host と違えば拒否（別のポートで動く別のページなど）
+    r = client.post("/api/refresh", headers={"Origin": "http://127.0.0.1:9999"})
+    assert r.status_code == 403
+    # X-Forwarded-Host は信頼しない（以前は X-Forwarded-Host と一致すれば通っていた）
+    r = client.post("/api/refresh", headers={"Origin": "http://evil.example", "X-Forwarded-Host": "evil.example"})
+    assert r.status_code == 403
+    # Origin: null（サンドボックスの iframe など）は拒否
+    assert client.post("/api/refresh", headers={"Origin": "null"}).status_code == 403
+    # GET は Origin を確認しない（Host は確認する）
     assert client.get("/api/state", headers={"Origin": "http://evil.example"}).status_code == 200
+
+
+def test_host_check_blocks_dns_rebinding(env):
+    client, *_ = env
+    # 攻撃者のドメインを 127.0.0.1 に向け直しても、Host が evil.example なら GET も含めて拒否する
+    for path in ("/api/state", "/api/config", "/api/health", "/", "/app.js"):
+        r = client.get(path, headers={"Host": "evil.example"})
+        assert r.status_code == 403, path
+        assert r.json()["error"] == "許可されていないホストへのリクエストです"
+    assert client.post("/api/refresh", headers={"Host": "evil.example:8484"}).status_code == 403
+    # X-Forwarded-Host を付けても通らない
+    r = client.get("/api/state", headers={"Host": "evil.example", "X-Forwarded-Host": "127.0.0.1:8484"})
+    assert r.status_code == 403
+    # 許可するもの: ループバック（ポートは問わない）・*.ts.net・設定の allowed_hosts
+    for host in ("127.0.0.1", "localhost:8484", "[::1]:8484", "pc.tail1234.ts.net", "MyPC:8484"):
+        assert client.get("/api/health", headers={"Host": host}).status_code == 200, host
+    for host in ("ts.net.evil.example", "evil-ts.net", "127.0.0.1.evil.example", ""):
+        assert not host_allowed(host, ["mypc"]), host
+
+
+def test_health(env):
+    client, *_ = env
+    assert client.get("/api/health").json() == {"app": "ccsmoni", "version": app_version()}
 
 
 # ---------------------------------------------------------------- config
@@ -248,17 +298,23 @@ def test_origin_check(env):
 
 def test_config_get_put(env):
     client, svc, cfg_path, _ = env
+    save(svc.store, reading("old", NOW))
+    save(svc.store, reading("a", NOW))
     d = client.get("/api/config").json()
     assert d["config"]["accounts"][0]["id"] == "a"
     assert d["error"] is None and d["candidates"][0]["suggested_id"] == "z"
     assert d["path"].endswith("config.toml")
+    assert d["palette"] == PALETTE
+    assert d["colors"] == {"a": "#112233", "b": PALETTE[1], "c": PALETTE[2]}
+    assert d["history_ids"] == ["a", "old"]
+    assert d["readonly"] == {"claude_path": "claude", "host": "127.0.0.1", "port": 8484}
 
     cfg = d["config"]
     cfg["accounts"][0]["label"] = "Aさん"
     r = client.put("/api/config", json={"config": cfg, "hash": d["hash"]})
     assert r.status_code == 200, r.text
     new_hash = r.json()["hash"]
-    assert "restart_required" not in r.json()
+    assert r.json() == {"hash": new_hash, "removed_keys": [], "backup_path": None}
     text = cfg_path.read_text(encoding="utf-8")
     assert 'label = "Aさん"' in text and "# 手書きのメモ" in text  # コメントは残る
     assert svc.scheduler.configs[-1].accounts[0].label == "Aさん"  # すぐ反映
@@ -277,11 +333,23 @@ def test_config_get_put(env):
     r = client.put("/api/config", json={"hash": new_hash})
     assert r.status_code == 422 and r.json()["error"] == "入力内容に誤りがあります"
 
-    # ポートの変更は再起動が必要
+    # claude_path・host・port は Web から変えられない（ファイルでだけ編集する）
     cfg["accounts"][0]["color"] = "#112233"
-    cfg["server"]["port"] = 9999
-    r = client.put("/api/config", json={"config": cfg, "hash": new_hash})
-    assert r.status_code == 200 and r.json()["restart_required"] is True
+    for sec, key, value in (("collector", "claude_path", "C:/evil/claude.exe"), ("collector", "claude_path", "calc.exe"),
+                            ("server", "host", "0.0.0.0"), ("server", "port", 9999)):
+        bad = {**cfg, sec: {**cfg[sec], key: value}}
+        r = client.put("/api/config", json={"config": bad, "hash": new_hash})
+        assert r.status_code == 422, (key, value)
+        assert r.json() == {"error": "この項目は設定ファイルで編集してください",
+                            "fields": [[f"{sec}.{key}", "この項目は設定ファイルで編集してください"]]}
+    assert "evil" not in cfg_path.read_text(encoding="utf-8")
+    # 省略したら今の値のまま（UI が readonly の項目を送らなくてもよい）
+    partial = {**cfg, "collector": {k: v for k, v in cfg["collector"].items() if k != "claude_path"},
+               "server": {"allowed_hosts": ["mypc", "other"]}}
+    r = client.put("/api/config", json={"config": partial, "hash": new_hash})
+    assert r.status_code == 200, r.text
+    assert svc.config_service.current.server.port == 8484
+    assert svc.config_service.current.server.allowed_hosts == ["mypc", "other"]
 
 
 # ---------------------------------------------------------------- 接続テスト / ログイン
@@ -296,6 +364,17 @@ def test_account_test_does_not_save(env):
     assert d["limits"][0]["pace"] is not None
     assert svc.store.latest() == {}  # 保存しない
     assert client.post("/api/accounts/test", json={}).status_code == 422
+
+
+def test_account_test_runs_one_at_a_time(env):
+    client, svc, *_ = env
+    rt = client.app.state.runtime
+    rt.testing = True  # 別の接続テストが実行中
+    r = client.post("/api/accounts/test", json={"config_dir": "~/x/new"})
+    assert r.status_code == 429 and r.json() == {"error": "接続テストを実行中です"}
+    rt.testing = False
+    assert client.post("/api/accounts/test", json={"config_dir": "~/x/new"}).status_code == 200
+    assert rt.testing is False  # 終わったら次を受け付ける
 
 
 def test_login(env):
@@ -333,3 +412,44 @@ def test_config_broken_file_can_be_overwritten(env):
     r = client.put("/api/config", json={"config": d["config"], "hash": d["hash"]})
     assert r.status_code == 200
     assert 'color = "#112233"' in cfg_path.read_text(encoding="utf-8")
+    assert r.json()["backup_path"] is None
+
+
+def test_config_syntax_error_is_fixed_by_saving(env):
+    client, svc, cfg_path, _ = env
+    good = client.get("/api/config").json()
+    cfg_path.write_text("[collector\nbroken", encoding="utf-8")
+    svc.config_service.poll()
+    st = client.get("/api/state").json()
+    assert st["config_error"] and st["config_hash"] != good["hash"]  # 設定画面が外部の変更に気づける
+    d = client.get("/api/config").json()
+    assert d["hash"] == st["config_hash"]
+    r = client.put("/api/config", json={"config": d["config"], "hash": d["hash"]})
+    assert r.status_code == 200, r.text
+    backup = r.json()["backup_path"]
+    assert backup and "config.toml.broken-" in backup
+    (b,) = cfg_path.parent.glob("config.toml.broken-*")
+    assert b.read_text(encoding="utf-8") == "[collector\nbroken"
+    assert "取得間隔（分）" in cfg_path.read_text(encoding="utf-8")  # 初期生成と同じ体裁で書き直した
+    assert client.get("/api/state").json()["config_error"] is None
+    assert client.get("/api/config").json()["config"] == good["config"]
+
+
+def test_config_unknown_keys_are_removed_on_save(env):
+    client, svc, cfg_path, _ = env
+    d = client.get("/api/config").json()
+    cfg_path.write_text(CONFIG.replace("default_interval_minutes = 10", "default_interval_minutes = 10\ntypo = 1"),
+                        encoding="utf-8")
+    svc.config_service.poll()
+    h = client.get("/api/config").json()["hash"]
+    r = client.put("/api/config", json={"config": d["config"], "hash": h})
+    assert r.status_code == 200 and r.json()["removed_keys"] == ["collector.typo"]
+    assert "typo" not in cfg_path.read_text(encoding="utf-8")
+
+
+def test_config_missing_file_keeps_last_valid(env):
+    client, svc, cfg_path, _ = env
+    cfg_path.unlink()
+    assert svc.config_service.poll() is None
+    st = client.get("/api/state").json()
+    assert "見つかりません" in st["config_error"] and len(st["accounts"]) == 3

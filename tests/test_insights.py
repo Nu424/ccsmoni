@@ -126,6 +126,18 @@ def test_window_points_matches_jitter():
     assert insights.window_points(rows, "session", 1000) == [(1, 1), (2, 2)]
 
 
+def test_window_points_prefers_window_id():
+    # resets_at が同じでも、使用率が大きく下がって別の枠（window_id）になった点は混ぜない
+    rows = [
+        {"kind": "session", "t": 1, "percent": 40, "resets_at": 1000, "window_id": 1},
+        {"kind": "session", "t": 2, "percent": 5, "resets_at": 1000, "window_id": 2},
+        {"kind": "session", "t": 3, "percent": 8, "resets_at": 1000, "window_id": 2},
+        {"kind": "weekly_all", "t": 3, "percent": 8, "resets_at": 1000, "window_id": 2},
+    ]
+    assert insights.window_points(rows, "session", 1000, window_id=2) == [(2, 5), (3, 8)]
+    assert len(insights.window_points(rows, "session", 1000)) == 3  # window_id が分からなければ resets_at で
+
+
 # ---------------------------------------------------------------- hints
 
 

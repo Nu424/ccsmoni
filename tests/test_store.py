@@ -78,8 +78,8 @@ def test_raw_restored(store):
 
 def test_window_absorbs_jitter_and_splits_new_window(store):
     put(store, at=T0, percent=10, resets_at=RESET)
-    put(store, at=T0 + timedelta(minutes=10), percent=30, resets_at=RESET - timedelta(minutes=1))
-    put(store, at=T0 + timedelta(minutes=20), percent=20, resets_at=RESET)
+    put(store, at=T0 + timedelta(minutes=10), percent=30, resets_at=RESET - timedelta(minutes=1))  # 丸めの揺れ
+    put(store, at=T0 + timedelta(minutes=20), percent=25, resets_at=RESET)  # 少し下がった（表示の揺れ）: 同じ枠
     put(store, at=T0 + timedelta(hours=5), percent=3, resets_at=RESET + timedelta(hours=5))
     hist = store.history(T0 - timedelta(days=1))
     ids = [h["window_id"] for h in hist]
@@ -91,6 +91,22 @@ def test_window_absorbs_jitter_and_splits_new_window(store):
     assert wins[0]["resets_at"] == int(RESET.timestamp())  # 最新の観測値
     assert wins[0]["first_seen"] == int(T0.timestamp())
     assert wins[0]["last_seen"] == int((T0 + timedelta(minutes=20)).timestamp())
+
+
+def test_window_splits_on_large_drop_with_same_resets_at(store):
+    # resets_at が同じでも、直前の値から 10 ポイント以上下がったらリセットされたとみなす（PLAN §4.2）
+    put(store, at=T0, percent=10, resets_at=RESET)
+    put(store, at=T0 + timedelta(minutes=10), percent=30, resets_at=RESET)
+    put(store, at=T0 + timedelta(minutes=20), percent=20, resets_at=RESET)  # 30% → 20%: ちょうど 10 下がった
+    put(store, at=T0 + timedelta(minutes=30), percent=11, resets_at=RESET)  # 20% → 11%: 9 だけなので同じ枠
+    ids = [h["window_id"] for h in store.history(T0 - timedelta(days=1))]
+    assert ids[0] == ids[1] != ids[2] == ids[3]
+    wins = store.windows(account_id="a", kind="session")
+    assert [w["peak_percent"] for w in wins] == [30, 20]
+    assert wins[1]["first_seen"] == int((T0 + timedelta(minutes=20)).timestamp())
+    # 他のアカウント・種類の値とは比べない
+    put(store, account="b", at=T0 + timedelta(minutes=40), percent=1, resets_at=RESET)
+    assert len(store.windows(account_id="a")) == 2 and len(store.windows(account_id="b")) == 1
 
 
 def test_window_is_per_account_and_kind(store):
@@ -175,10 +191,12 @@ def test_reparse_rebuilds_limits_and_windows(store):
     before_ids, n = window_shape()
     assert store.reparse(FixedParser()) == 4
     assert [h["percent"] for h in store.history(T0 - timedelta(days=1))] == [10, 40, 20, 7]
-    # reparse の ResetsAt は固定 RESET なので 5時間後も同じ枠になる。割り当て規則は決定的
+    # reparse の resets_at は固定 RESET。それでも 40→20、20→7 と 10 ポイント以上下がったところで枠が分かれる。
+    # 割り当て規則は決定的（もう一度 reparse しても同じ）
+    first = store.windows()
     assert store.reparse(FixedParser()) == 4
-    assert len(store.windows()) == 1
-    assert store.windows()[0]["peak_percent"] == 40
+    assert store.windows() == first
+    assert [w["peak_percent"] for w in first] == [40, 20, 7]
     assert n == 2 and len(before_ids) == 4
 
 
@@ -193,16 +211,25 @@ def test_reparse_same_window_assignment_as_save(store):
                               datetime.fromtimestamp(raw.meta["r"], UTC)),),
             )
 
-    for i, (pct, r) in enumerate([(10, RESET), (30, RESET - timedelta(minutes=1)),
+    for i, (pct, r) in enumerate([(10, RESET), (30, RESET - timedelta(minutes=1)), (15, RESET),
                                   (5, RESET + timedelta(hours=5))]):
         at = T0 + timedelta(hours=2 * i)
         raw = RawResult("cli-usage", at, 1, str(pct), 0, meta={"r": int(r.timestamp())})
         store.save(raw, make_reading(at=at, percent=pct, resets_at=r))
     since = T0 - timedelta(days=1)
     h1, w1 = store.history(since), store.windows()
-    assert store.reparse(EchoParser()) == 3
+    assert len(w1) == 3  # 30→15 の下がり（resets_at は同じ）で分かれている
+    assert store.reparse(EchoParser()) == 4
     assert store.history(since) == h1
     assert store.windows() == w1
+
+
+def test_account_ids(store):
+    assert store.account_ids() == []
+    put(store, account="b", at=T0)
+    put(store, account="a", at=T0, status=Status.ERROR)
+    put(store, account="b", at=T0 + timedelta(minutes=1))
+    assert store.account_ids() == ["a", "b"]
 
 
 def test_persists_to_file_and_wal(tmp_path):

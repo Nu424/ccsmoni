@@ -13,7 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone, tzinfo
 from typing import Any
 
-from ccsmoni.model import Limit
+from ccsmoni.model import WINDOW_TOLERANCE_SEC, Limit
 
 # ---------------------------------------------------------------- 枠の長さ・しきい値
 
@@ -40,8 +40,7 @@ LOSE_MIN_REMAINING = 30
 
 MAX_HINTS = 2
 
-# 同じ枠とみなす resets_at の許容幅（store.WINDOW_TOLERANCE_SEC と同じ考え方。表示の丸めの揺れを吸収）
-WINDOW_TOLERANCE_SEC = 15 * 60
+# 同じ枠とみなす resets_at の許容幅は model.WINDOW_TOLERANCE_SEC（store と共通）
 
 # 推移グラフで「取得の抜け」とみなす間隔（取得間隔の何倍か）
 GAP_FACTOR = 3
@@ -76,8 +75,16 @@ def limit_to_api(lim: Limit) -> dict[str, Any]:
 # ---------------------------------------------------------------- ペース・枯渇予測
 
 
-def window_points(rows: Iterable[Mapping[str, Any]], kind: str, resets_at: float) -> list[tuple[float, float]]:
-    """store.history の行から、同じ枠（kind が同じで resets_at が許容幅内）の (t, percent) を取り出す。"""
+def window_points(
+    rows: Iterable[Mapping[str, Any]], kind: str, resets_at: float, window_id: int | None = None
+) -> list[tuple[float, float]]:
+    """store.history の行から、同じ枠の (t, percent) を取り出す。
+
+    window_id が分かっていればそれで選ぶ（resets_at が同じでも、使用率が大きく下がって別の枠になった場合を分けるため）。
+    分からなければ、kind が同じで resets_at が許容幅内のものを選ぶ。
+    """
+    if window_id is not None:
+        return [(r["t"], r["percent"]) for r in rows if r["kind"] == kind and r.get("window_id") == window_id]
     return [
         (r["t"], r["percent"])
         for r in rows
