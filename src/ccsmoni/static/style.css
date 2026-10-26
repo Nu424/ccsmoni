@@ -152,6 +152,9 @@ button { font: inherit; color: inherit; }
 .banner.tone-danger { border-color: color-mix(in srgb, var(--danger) 40%, transparent); background: color-mix(in srgb, var(--danger) 9%, var(--surface)); }
 .banner.tone-warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, var(--surface)); }
 .banner.tone-info { border-color: color-mix(in srgb, var(--info) 35%, transparent); background: color-mix(in srgb, var(--info) 8%, var(--surface)); }
+.settings-banners { display: grid; gap: 8px; }
+.settings-banners:not(:empty) { margin-bottom: 16px; }
+.settings-banners .banner { margin-top: 0; }
 .banner-detail { color: var(--text-3); font-family: var(--font-mono); font-size: 12px; }
 
 .notice {
@@ -301,7 +304,19 @@ code.inline { background: var(--surface); border: 1px solid var(--border); borde
 .legend-reset { border: 0; background: none; color: var(--accent); cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 0 6px; }
 .legend-help { color: var(--text-3); font-size: 11.5px; margin-left: 6px; }
 .chart-host { position: relative; min-height: 240px; transition: opacity .2s; }
-.chart-host.is-loading { opacity: .5; }
+/* 期間の切り替え中: 前のグラフを薄くして、右上に「読み込み中」を重ねる */
+.chart-host.is-loading > :not(.chart-loading) { opacity: .4; transition: opacity .2s; }
+.chart-loading { position: absolute; top: 8px; right: 10px; z-index: 6; display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; background: var(--surface); border: 1px solid var(--border); color: var(--text-3); font-size: 12px; }
+.chart-empty.is-error { flex-wrap: wrap; color: var(--text-2); }
+/* アーカイブ（設定から外したアカウントの履歴）: 凡例の末尾に区切りを入れて薄く出す */
+.legend-sep { color: var(--text-3); font-size: 11px; font-weight: 600; margin-left: 6px; padding-left: 10px; border-left: 1px solid var(--border); }
+.legend-item.is-archived { border-style: dashed; font-weight: 500; color: var(--text-2); }
+.legend-item.is-archived.is-off { opacity: .55; }
+.legend-item.is-archived.is-off span:last-child { text-decoration: none; }
+.legend-tail { display: contents; }
+.peak tr.is-archived th.peak-name { color: var(--text-3); font-weight: 500; }
+.peak tr.is-archived .peak-cell { opacity: .7; }
 .chart-empty { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 240px; color: var(--text-3); font-size: 13px; }
 .chart-empty.is-sparse { flex-direction: column; gap: 4px; text-align: center; }
 .chart-empty.is-sparse b { color: var(--text-2); font-weight: 600; }
@@ -402,6 +417,8 @@ code.inline { background: var(--surface); border: 1px solid var(--border); borde
 .field.is-wide { grid-column: 1 / -1; }
 .field-label { font-size: 12px; font-weight: 700; color: var(--text-2); }
 .field-help { font-size: 11.5px; color: var(--text-3); }
+.field-note { font-size: 11.5px; line-height: 1.45; }
+.field-note[hidden] { display: none; }
 .field-error { font-size: 12px; color: var(--danger); font-weight: 600; }
 .field-error::before { content: "⚠ "; }
 .field.has-error input { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }

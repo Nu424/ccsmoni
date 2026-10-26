@@ -7,7 +7,7 @@
 //       画面は mount / unmount / onState を持つ小さなオブジェクト。
 
 import { api } from "./api.js";
-import { h, setChildren, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref } from "./ui.js";
+import { h, setChildren, fmtAgo, fmtIn, fmtCountdown, spinner, toast, savePref, loginRetaken } from "./ui.js";
 import { createDashboard } from "./dashboard.js";
 import { createSettings } from "./settings.js";
 
@@ -57,6 +57,7 @@ function route() {
   if (store.server) current.onState(store.server);
   document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.route === name ? "page" : "false"));
   window.scrollTo(0, 0);
+  renderBanner(); // 設定画面では「設定ファイルに誤り」の帯を画面側に任せるので、移動のたびに出し直す
 }
 window.addEventListener("hashchange", route);
 window.addEventListener("beforeunload", (e) => {
@@ -91,7 +92,9 @@ function fastPoll() {
   const s = store.server;
   if (store.refreshPending || store.connError) return true;
   if (!s) return true;
-  return s.collector.busy.length > 0 || s.accounts.some((a) => a.login && a.login.state === "waiting");
+  return s.collector.busy.length > 0 || s.accounts.some((a) => a.login && a.login.state === "waiting") ||
+    s.accounts.some((a) => a.login && a.login.state === "done" && !loginRetaken(a));
+
 }
 
 // ---- 今すぐ更新 ---------------------------------------------------------------
@@ -177,7 +180,8 @@ function renderBanner() {
     items.push(h("div.banner.tone-danger", [spinner(), " サーバーに接続できません。再接続しています…"]));
   }
   const ce = store.server && store.server.config_error;
-  if (ce) {
+  // 設定画面は同じ内容を画面の中の帯で出す（2つ並ばないように、こちらは出さない）
+  if (ce && currentName !== "settings") {
     items.push(h("div.banner.tone-warn", [
       h("b", "設定ファイルに誤りがあります。"), " 最後に有効だった設定で動いています。 ",
       h("span.banner-detail", ce), " ", h("a", { href: "#/settings" }, "設定を開く"),

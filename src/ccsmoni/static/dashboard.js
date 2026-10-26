@@ -7,7 +7,7 @@
 
 import { api } from "./api.js";
 import { h, setChildren, bar, statusChip, chip, segmented, spinner, toast, copyCmd, fmtPct, fmtAgo, fmtCountdown, fmtDate,
-  fmtDateTime, loadPref, savePref, readableColor, cssVar, level } from "./ui.js";
+  fmtDateTime, loadPref, savePref, readableColor, cssVar, level, loginRetaken } from "./ui.js";
 import { overlayChart, multiplesChart } from "./chart.js";
 
 const KIND_OPTS = [{ value: "weekly_all", label: "週間" }, { value: "session", label: "5h" }];
@@ -21,6 +21,8 @@ export function createDashboard(ctx) {
     mode: loadPref("chart.mode", "overlay"),
     hidden: new Set(loadPref("chart.hidden", [])),
     focus: null,
+    focusUnhid: null,     // カードを押して強調するために、一時的に表示に戻したアカウント（強調を解いたら非表示に戻す）
+    archShown: new Set(), // 表示中のアーカイブ（設定から外したアカウントの履歴）。既定は非表示で、保存もしない
     history: null, historyKey: null, historyLoading: false, historyError: null,
     windows: null,
     showDisabled: false,
@@ -31,6 +33,11 @@ export function createDashboard(ctx) {
   let root, cardsEl, noticeEl, chartHost, legendEl, ctrlEl, peaksEl, chartNote, chartInfo;
   let chart = null;
   let lastRunSeen = null;
+  let historySeq = 0;     // 古い応答で新しい期間の表示を上書きしないための番号
+  let legendSig = null;   // 凡例の DOM を作ったときの中身（変わったときだけ作り直す）
+  let legendTail = null;
+  let chartSig = null;    // グラフを作ったときに並べたアカウント（変わったら作り直す）
+  const plotSig = () => JSON.stringify(plotAccounts(true).map((a) => [a.id, a.color, !!a.archived]));
 
   // ---- 骨組み ----------------------------------------------------------------
   function mount(el) {
@@ -79,23 +86,31 @@ export function createDashboard(ctx) {
       loadWindows();
     }
     if (!s.collector.busy.length) lastRunSeen = lr;
-    if (!dash.history) renderChart();
+    // 並ぶアカウント（追加・削除でアーカイブに移った等）が変わったら、グラフも作り直す
+    if (!dash.history || (chartSig != null && chartSig !== plotSig())) renderChart();
     if (dash.windows) renderPeaks();
   }
 
   // ---- データの読み込み -----------------------------------------------------------
+  // quiet: 新しい取得結果が入ったときの裏での取り直し（同じ期間）。失敗しても今のグラフは正しいので残す。
+  // 期間を切り替えたとき（quiet でない）に失敗したら、古い期間のグラフは消して「取得できませんでした」を出す
+  // （残すと、新しい期間のラベルのまま古いグラフが見えてしまう）。
   async function loadHistory(quiet = false) {
     const key = dash.range;
-    dash.historyLoading = !quiet;
-    if (!quiet) renderChartLoading();
+    const seq = ++historySeq;
+    if (!quiet) { dash.historyLoading = true; renderChartLoading(); }
     try {
       const data = await api.history(key, ["weekly_all", "session"]);
-      if (key !== dash.range) return; // 途中で期間が変わった
+      if (seq !== historySeq || key !== dash.range) return; // 途中で期間が変わった・新しい取得が始まった
       dash.history = data;
       dash.historyKey = key;
       dash.historyError = null;
     } catch (e) {
-      dash.historyError = e.message;
+      if (seq !== historySeq || key !== dash.range) return;
+      if (quiet && dash.history && dash.historyKey === key) return;
+      dash.history = null;
+      dash.historyKey = null;
+      dash.historyError = e.message || "サーバーに接続できません";
     }
     dash.historyLoading = false;
     renderChart();
@@ -135,6 +150,7 @@ export function createDashboard(ctx) {
     const shown = ok ? a.limits : a.last_ok ? a.last_ok.limits : [];
     const lim = (k) => shown.find((l) => l.kind === k);
     const isFocus = dash.focus === a.id;
+    const staleShown = a.enabled && a.stale && a.status !== "never";
 
     const head = h("div.card-head", [
       h("span.sw", { style: { background: color } }),
@@ -142,8 +158,9 @@ export function createDashboard(ctx) {
       a.plan ? h("span.badge", a.plan.toUpperCase()) : null,
       h("span.grow"),
       busy.has(a.id) ? h("span.card-busy", { title: "取得中" }, spinner()) : null,
-      a.stale && a.status !== "never" ? statusChip("stale") : null,
-      a.status !== "ok" || !a.stale ? statusChip(a.status) : null,
+      // 無効なアカウントは取りに行っていないので、古くて当然（「データが古い」は出さない）
+      staleShown ? statusChip("stale") : null,
+      a.status !== "ok" || !staleShown ? statusChip(a.status) : null,
     ]);
 
     const rows = [];
@@ -207,11 +224,15 @@ export function createDashboard(ctx) {
   }
 
   // ログインの流れ（PLAN §5.2）。ログイン切れのとき、またはログインを進めている途中に出す。
+  // 完了（done）のあとは、取り直した結果が state に入るまで「取り直しています…」を出す。
+  // そのあいだ status はまだ logged_out のままなので、ここで［ログイン］を出すと、終わったのにまた押させてしまう。
   function loginBlock(a) {
     const lg = a.login;
     const waitingLocal = dash.loginBusy.has(a.id) && !(lg && lg.state === "waiting");
+    const retaking = !!lg && lg.state === "done" && !loginRetaken(a);
     if (a.status !== "logged_out" && !lg) return null;
-    if (a.status === "ok" && lg && lg.state === "done") return null;
+    // 取り直しが済んで、ログイン切れでなくなった（または別の理由のエラーになった）なら、ここはもう出さない
+    if (lg && lg.state === "done" && !retaking && a.status !== "logged_out") return null;
     const stop = (e) => e.stopPropagation();
     const manual = a.launch_command
       ? h("div.login-manual", [h("span", "手動でするなら、起動してから /login:"), copyCmd(a.launch_command), h("span", "→"), h("code.inline", "/login")])
@@ -233,32 +254,44 @@ export function createDashboard(ctx) {
     }, label);
 
     let main;
-    if (waitingLocal) {
+    let showManual = a.status === "logged_out";
+    if (retaking) {
+      main = h("div.login-state.tone-text-ok", [spinner(), h("span", "ログインしました。取り直しています…")]);
+      showManual = false;
+    } else if (lg && lg.state === "mismatch") {
+      // ログイン自体は済んでいる。押し直させず、確かめてもらうだけにする
+      main = h("div.login-state.tone-box-warn", [h("span", [h("b", "前回と別のアカウントでログインした可能性があります。"), h("br"),
+        h("span.muted", "使用率が別のアカウントのものになっていないか確かめてください。")])]);
+      showManual = false;
+    } else if (waitingLocal) {
       main = h("div.login-state", [spinner(), h("span", "PC 側でログイン画面を開いています…")]);
-    } else if (!lg || (a.status === "logged_out" && lg.state === "done")) {
+    } else if (!lg || lg.state === "done") {
+      // done で取り直しも済んだのに、まだログイン切れ（別の設定フォルダでログインした等）なら、もう一度押せるようにする
       main = h("div.login-state", [loginBtn("ログイン"), h("span.muted", "PC にログイン画面を開きます")]);
     } else if (lg.state === "waiting") {
       main = h("div.login-state", [spinner(), h("span", [h("b", "PC 側でログインしてください…"),
         h("br"), h("span.muted", [lg.message || "", lg.message ? "・" : "", "開始 ", h("span", { dataset: { ago: lg.started_at } }, fmtAgo(lg.started_at, ctx.now()))])])]);
-    } else if (lg.state === "done") {
-      main = h("div.login-state.tone-text-ok", [spinner(), h("span", "ログインしました。取り直しています…")]);
-    } else if (lg.state === "mismatch") {
-      main = h("div.login-state.tone-box-warn", [h("span", [h("b", "前回と別のアカウントでログインした可能性があります。"), h("br"),
-        h("span.muted", "使用率が別のアカウントのものになっていないか確かめてください。")])]);
     } else {
       main = h("div.login-state.tone-box-danger", [h("span", lg.state === "timeout" ? "時間内にログインが終わりませんでした。" : (lg.message || "ログインに失敗しました。")), loginBtn("もう一度")]);
     }
-    return h("div.login", { onclick: stop }, [main, a.status === "logged_out" ? manual : null]);
+    return h("div.login", { onclick: stop }, [main, showManual ? manual : null]);
   }
 
-  // カードを押す → 強調。もう一度押す → 元に戻す。非表示にしていたら表示に戻す（押したのに見えないのを防ぐ）。
+  // カードを押す → 強調。もう一度押す → 元に戻す。
+  // 凡例で非表示にしていたら、強調しているあいだだけ表示に戻す（押したのに見えないのを防ぐ）。
+  // 強調を解いたら（別のカードに移ったときも）、元の非表示に戻す。
   function toggleFocus(id) {
     dash.focus = dash.focus === id ? null : id;
-    if (dash.focus && dash.hidden.has(id)) {
-      dash.hidden.delete(id);
-      persistHidden();
-      chart && chart.setHidden && chart.setHidden(dash.hidden);
+    if (dash.focusUnhid && dash.focusUnhid !== dash.focus) {
+      dash.hidden.add(dash.focusUnhid);
+      dash.focusUnhid = null;
     }
+    if (dash.focus && dash.hidden.has(dash.focus)) {
+      dash.hidden.delete(dash.focus);
+      dash.focusUnhid = dash.focus;
+    }
+    persistHidden();
+    chart && chart.setHidden && chart.setHidden(effectiveHidden());
     renderCards();
     renderLegend();
     if (dash.mode === "multi") renderChart();
@@ -306,64 +339,157 @@ export function createDashboard(ctx) {
     if (!server) return [];
     return server.accounts.filter((a) => a.enabled);
   }
+  // アーカイブ: 履歴はあるが設定に無いアカウント（設定から削除したもの）。凡例の末尾に薄く出し、押すと表示する。
+  // 古いサーバーは archived を返さないので、無ければ空として扱う。
+  function archivedAccounts() {
+    if (!server || !Array.isArray(server.archived)) return [];
+    const known = new Set(server.accounts.map((a) => a.id));
+    return server.archived.filter((a) => a && a.id && !known.has(a.id))
+      .map((a) => ({ id: a.id, label: a.label || a.id, color: a.color || "#888888", archived: true }));
+  }
+  // グラフ・表に出すアカウント。all=true なら非表示のアーカイブも含める（重ねる表示は作り直さずに出し入れするため）
+  function plotAccounts(all = false) {
+    const arch = archivedAccounts().filter((a) => all || dash.archShown.has(a.id));
+    return [...chartAccounts().map((a) => ({ id: a.id, label: a.label, color: a.color })), ...arch];
+  }
+  // 線を出さないもの = 凡例で消したもの + 表示にしていないアーカイブ
+  function effectiveHidden() {
+    const out = new Set(dash.hidden);
+    for (const a of archivedAccounts()) if (!dash.archShown.has(a.id)) out.add(a.id);
+    return out;
+  }
 
   // 凡例: 押す → 表示／非表示。ダブルクリック（スマホは長押し）→ それだけ表示。もう一度で全部表示。
+  // 1回目の click で DOM を作り直すと、2回目の click と dblclick が消えた要素に届かなくなるので、
+  // 作り直すのは並ぶアカウント（名前・色）が変わったときだけにして、ふだんは class だけ書き換える。
   function renderLegend() {
     if (!legendEl || !server) return;
-    if (dash.mode === "multi") { legendEl.replaceChildren(); legendEl.hidden = true; return; }
+    if (dash.mode === "multi") { legendEl.replaceChildren(); legendEl.hidden = true; legendSig = null; return; }
     legendEl.hidden = false;
     const accts = chartAccounts();
+    const arch = archivedAccounts();
     const bg = cssVar("--surface") || "#fff";
-    const items = accts.map((a) => {
-      const visible = !dash.hidden.has(a.id);
-      let pressTimer = null, longPressed = false;
-      return h("button.legend-item", {
-        type: "button",
-        class: [visible ? "" : "is-off", dash.focus === a.id ? "is-focus" : ""].join(" "),
-        "aria-pressed": String(visible),
-        title: "押すと表示／非表示。ダブルクリック（長押し）でこれだけ表示",
-        onclick: () => {
-          if (longPressed) { longPressed = false; return; }
-          if (visible) dash.hidden.add(a.id); else dash.hidden.delete(a.id);
-          if (visible && dash.focus === a.id) { dash.focus = null; chart && chart.setFocus && chart.setFocus(null); renderCards(); }
-          applyHidden();
-        },
-        ondblclick: () => solo(a.id, accts),
-        onpointerdown: (e) => {
-          if (e.pointerType !== "touch") return;
-          longPressed = false;
-          pressTimer = setTimeout(() => { longPressed = true; solo(a.id, accts); navigator.vibrate && navigator.vibrate(15); }, 520);
-        },
-        onpointerup: () => clearTimeout(pressTimer),
-        onpointerleave: () => clearTimeout(pressTimer),
-        oncontextmenu: (e) => { if (longPressed) e.preventDefault(); },
-      }, [h("span.sw", { style: { background: readableColor(a.color, bg) } }), h("span", a.label)]);
-    });
-    const allHidden = accts.length && accts.every((a) => dash.hidden.has(a.id));
-    setChildren(legendEl, ...items,
-      dash.hidden.size && accts.some((a) => dash.hidden.has(a.id))
-        ? h("button.legend-reset", { type: "button", onclick: () => { dash.hidden.clear(); applyHidden(); } }, "全部表示")
-        : h("span.legend-help.hide-sm", "押すと表示／非表示・ダブルクリックでそれだけ表示"),
-    );
+    const sig = JSON.stringify([bg, accts.map((a) => [a.id, a.label, a.color]), arch.map((a) => [a.id, a.label, a.color])]);
+    if (sig !== legendSig) {
+      legendSig = sig;
+      legendTail = h("span.legend-tail");
+      setChildren(legendEl,
+        ...accts.map((a) => legendItem(a, bg)),
+        arch.length ? h("span.legend-sep", { title: "設定から外したアカウントの履歴です" }, "アーカイブ") : null,
+        ...arch.map((a) => archivedItem(a, bg)),
+        legendTail,
+      );
+    }
+    updateLegend();
+  }
+  // クリックは 250ms 待ってから切り替え、そのあいだに dblclick が来たら取り消して「それだけ表示」にする。
+  // タッチは長押し（520ms）が「それだけ表示」。タッチとキーボードの click は待たずに切り替える。
+  function legendItem(a, bg) {
+    let clickTimer = null, pressTimer = null, longPressed = false, touch = false;
+    const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
+    return h("button.legend-item", {
+      type: "button",
+      dataset: { id: a.id },
+      title: "押すと表示／非表示。ダブルクリック（長押し）でこれだけ表示",
+      onclick: (e) => {
+        if (longPressed) { longPressed = false; return; } // 長押しのあとに来る click は無視する
+        if (touch || e.detail === 0) { toggleVisible(a.id); return; }
+        clearTimeout(clickTimer);
+        clickTimer = setTimeout(() => { clickTimer = null; toggleVisible(a.id); }, 250);
+      },
+      ondblclick: () => {
+        if (touch) return;
+        clearTimeout(clickTimer);
+        clickTimer = null;
+        solo(a.id);
+      },
+      onpointerdown: (e) => {
+        touch = e.pointerType === "touch";
+        longPressed = false;
+        cancelPress();
+        if (!touch) return;
+        pressTimer = setTimeout(() => { pressTimer = null; longPressed = true; solo(a.id); navigator.vibrate && navigator.vibrate(15); }, 520);
+      },
+      onpointerup: cancelPress,
+      onpointerleave: cancelPress,
+      onpointercancel: cancelPress,
+      oncontextmenu: (e) => { if (longPressed || pressTimer) e.preventDefault(); },
+    }, [h("span.sw", { style: { background: readableColor(a.color, bg) } }), h("span", a.label)]);
+  }
+  function archivedItem(a, bg) {
+    return h("button.legend-item.is-archived", {
+      type: "button",
+      dataset: { id: a.id, archived: "1" },
+      title: "設定から外したアカウントの履歴。押すと表示／非表示",
+      onclick: () => {
+        if (dash.archShown.has(a.id)) dash.archShown.delete(a.id); else dash.archShown.add(a.id);
+        // 表示する範囲（x 軸の左端など）が変わりうるので、グラフは作り直す
+        renderChart();
+        renderPeaks();
+      },
+    }, [h("span.sw", { style: { background: readableColor(a.color, bg) } }), h("span", a.label)]);
+  }
+  // 凡例の見た目（押されているか・強調・「全部表示」）だけを今の状態に合わせる
+  function updateLegend() {
+    if (!legendEl || legendEl.hidden) return;
+    const accts = chartAccounts();
+    for (const el of legendEl.querySelectorAll(".legend-item")) {
+      const id = el.dataset.id;
+      const visible = el.dataset.archived ? dash.archShown.has(id) : !dash.hidden.has(id);
+      el.classList.toggle("is-off", !visible);
+      el.classList.toggle("is-focus", dash.focus === id);
+      el.setAttribute("aria-pressed", String(visible));
+    }
+    const someHidden = accts.some((a) => dash.hidden.has(a.id));
+    if (legendTail) {
+      setChildren(legendTail, someHidden
+        ? h("button.legend-reset", { type: "button", onclick: () => showAll() }, "全部表示")
+        : h("span.legend-help.hide-sm", "押すと表示／非表示・ダブルクリックでそれだけ表示"));
+    }
+    const allHidden = accts.length && accts.every((a) => dash.hidden.has(a.id)) &&
+      !archivedAccounts().some((a) => dash.archShown.has(a.id));
     chartHost.classList.toggle("all-hidden", !!allHidden);
   }
-  function solo(id, accts) {
-    const others = accts.filter((a) => a.id !== id);
+  function toggleVisible(id) {
+    const visible = !dash.hidden.has(id);
+    if (visible) dash.hidden.add(id); else dash.hidden.delete(id);
+    // 自分で表示／非表示を決めたので、強調を解いたときに戻す対象からは外す
+    if (dash.focusUnhid === id) dash.focusUnhid = null;
+    if (visible && dash.focus === id) { dash.focus = null; chart && chart.setFocus && chart.setFocus(null); renderCards(); }
+    applyHidden();
+  }
+  function solo(id) {
+    const others = chartAccounts().filter((a) => a.id !== id);
     const isSolo = !dash.hidden.has(id) && others.every((a) => dash.hidden.has(a.id));
     dash.hidden = isSolo ? new Set() : new Set(others.map((a) => a.id));
+    dash.focusUnhid = null;
+    applyHidden();
+  }
+  function showAll() {
+    dash.hidden.clear();
+    dash.focusUnhid = null;
     applyHidden();
   }
   function applyHidden() {
     persistHidden();
-    chart && chart.setHidden && chart.setHidden(dash.hidden);
-    renderLegend();
+    chart && chart.setHidden && chart.setHidden(effectiveHidden());
+    updateLegend();
   }
-  function persistHidden() { savePref("chart.hidden", [...dash.hidden]); }
+  // 強調のために一時的に表示に戻したものは、非表示のまま保存する（再読み込みしても元の状態に戻るように）
+  function persistHidden() {
+    const out = new Set(dash.hidden);
+    if (dash.focusUnhid) out.add(dash.focusUnhid);
+    savePref("chart.hidden", [...out]);
+  }
 
   // ---- グラフ本体 --------------------------------------------------------------------
+  // 期間を切り替えて取りに行っているあいだ: グラフがあれば薄くして「読み込み中」を重ね、無ければ読み込み中だけを出す。
+  // 「記録開始: …」の注記は前の期間のものなので隠す。
   function renderChartLoading() {
-    if (!chart) setChildren(chartHost, h("div.chart-empty", [spinner(), " 読み込み中…"]));
-    else chartHost.classList.add("is-loading");
+    setChildren(chartInfo); chartInfo.hidden = true;
+    if (!chart) { setChildren(chartHost, h("div.chart-empty", [spinner(), " 読み込み中…"])); setChildren(chartNote); return; }
+    chartHost.classList.add("is-loading");
+    if (!chartHost.querySelector(".chart-loading")) chartHost.append(h("div.chart-loading", [spinner(), " 読み込み中…"]));
   }
   function renderChart() {
     if (!chartHost) return;
@@ -371,17 +497,22 @@ export function createDashboard(ctx) {
     chart && chart.destroy();
     chart = null;
     chartHost.replaceChildren();
-    if (dash.historyError && !dash.history) {
-      chartHost.append(h("div.chart-empty", ["グラフを読み込めませんでした（", dash.historyError, "）",
-        h("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => loadHistory() }, "再試行")]));
-      return;
-    }
     if (!dash.history || !server) {
-      chartHost.append(h("div.chart-empty", [spinner(), " 読み込み中…"]));
+      setChildren(chartInfo); chartInfo.hidden = true;
+      setChildren(chartNote);
+      if (dash.historyError && !dash.historyLoading) {
+        chartHost.append(h("div.chart-empty.is-error", [h("span", ["取得できませんでした（", dash.historyError, "）"]),
+          h("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => loadHistory() }, "再試行")]));
+      } else {
+        chartHost.append(h("div.chart-empty", [spinner(), " 読み込み中…"]));
+      }
+      renderLegend();
       return;
     }
-    const accounts = chartAccounts().map((a) => ({ id: a.id, label: a.label, color: a.color }));
-    const ext = dataExtent(accounts);
+    // 重ねる表示は、非表示のアーカイブも作っておいて setHidden で出し入れする。x 軸の範囲は表示するものだけで決める
+    const accounts = dash.mode === "multi" ? plotAccounts() : plotAccounts(true);
+    chartSig = plotSig();
+    const ext = dataExtent(plotAccounts());
     renderChartInfo(ext);
     if (ext.sparse) {
       // 数点しかないと線にならず、空のグラフに見えるだけなので、グラフは作らずに理由を出す
@@ -392,11 +523,11 @@ export function createDashboard(ctx) {
     } else if (dash.mode === "multi") {
       chart = multiplesChart({ el: chartHost, history: dash.history, accounts, focus: dash.focus, xMin: ext.xMin });
     } else {
-      chart = overlayChart({ el: chartHost, history: dash.history, kind: dash.kind, accounts, hidden: dash.hidden,
+      chart = overlayChart({ el: chartHost, history: dash.history, kind: dash.kind, accounts, hidden: effectiveHidden(),
         focus: dash.focus, xMin: ext.xMin });
       if (!chart.hasData) chartHost.append(h("div.chart-empty.on-top", "この期間のデータはまだありません"));
       chartHost.append(h("div.chart-allhidden", ["すべて非表示になっています ",
-        h("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => { dash.hidden.clear(); applyHidden(); } }, "全部表示")]));
+        h("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => showAll() }, "全部表示")]));
     }
     renderLegend();
     // グラフを描かないときは、印の説明も出さない
@@ -454,8 +585,9 @@ export function createDashboard(ctx) {
   function renderPeaks() {
     if (!peaksEl || !dash.windows || !server) return;
     const now = ctx.now();
-    // グラフと同じく有効なアカウントだけ（設定から消したアカウントの履歴も出さない）
-    const order = chartAccounts().map((a) => a.id);
+    // グラフと同じく、有効なアカウントと、凡例で表示にしたアーカイブだけ
+    const shown = plotAccounts();
+    const order = shown.map((a) => a.id);
     const rows = [...dash.windows.rows].filter((r) => r.windows.length && order.includes(r.account_id))
       .sort((x, y) => order.indexOf(x.account_id) - order.indexOf(y.account_id));
     const cols = Math.min(8, Math.max(0, ...rows.map((r) => r.windows.length)));
@@ -463,8 +595,8 @@ export function createDashboard(ctx) {
     const head = h("tr", [h("th.peak-name", { scope: "col" }, "アカウント"),
       ...Array.from({ length: cols }, (_, i) => h("th", { scope: "col", class: `c${i}` }, i === 0 ? "今週" : `${i}週前`))]);
     const body = rows.map((r) => {
-      const a = server.accounts.find((x) => x.id === r.account_id) || { label: r.account_id, color: "#888888" };
-      return h("tr", [
+      const a = shown.find((x) => x.id === r.account_id) || { label: r.account_id, color: "#888888" };
+      return h("tr", { class: a.archived ? "is-archived" : "" }, [
         h("th.peak-name", { scope: "row" }, h("span.peak-name-in", [h("span.sw", { style: { background: readableColor(a.color, bg) } }), h("span", a.label)])),
         ...Array.from({ length: cols }, (_, i) => {
           const w = r.windows[i];

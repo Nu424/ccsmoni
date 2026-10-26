@@ -74,7 +74,9 @@ const WD = ["日", "月", "火", "水", "木", "金", "土"];
 
 export function fmtPct(p) {
   if (p == null || Number.isNaN(p)) return "—";
-  return (Math.round(p * 10) / 10).toFixed(p >= 10 || Number.isInteger(p) ? 0 : 1) + "%";
+  // 丸めたあとの値で桁を決める（9.96 → 「10.0%」ではなく「10%」）
+  const r = Math.round(p * 10) / 10;
+  return r.toFixed(r >= 10 || Number.isInteger(r) ? 0 : 1) + "%";
 }
 
 // 「2分前」「たった今」。now, t は epoch 秒。
@@ -94,7 +96,7 @@ export function fmtCountdown(t, now) {
   if (s <= 0) return null;
   if (s < 86400) {
     const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60);
-    if (hh === 0) return `あと ${mm}分`;
+    if (hh === 0) return mm ? `あと ${mm}分` : "あと 1分未満";
     return `あと ${hh}:${pad2(mm)}`;
   }
   const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600);
@@ -106,8 +108,11 @@ export function fmtIn(t, now) {
   if (!t) return "—";
   const s = t - now;
   if (s <= 15) return "まもなく";
-  if (s < 3600) return `${Math.ceil(s / 60)}分後`;
-  return `${Math.floor(s / 3600)}時間${Math.round((s % 3600) / 60)}分後`;
+  // 分に切り上げてから時間と分に分ける（先に時間を割ると「1時間60分後」「60分後」になる）
+  const m = Math.ceil(s / 60);
+  if (m < 60) return `${m}分後`;
+  const hh = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${hh}時間${mm}分後` : `${hh}時間後`;
 }
 
 export function fmtClock(t) {
@@ -129,6 +134,16 @@ export function level(p, ui) {
   if (p >= ui.danger_percent) return "danger";
   if (p >= ui.warn_percent) return "warn";
   return "ok";
+}
+
+// ログインが終わったあと、取り直した結果がもう state に入っているか。
+// 完了（finished_at。古いサーバーには無いので started_at）より後に取得していれば取り直し済み。
+// 推移画面の表示（スピナーを出すか）と、app.js の「速く問い合わせるか」で同じ判定を使う。
+export function loginRetaken(a) {
+  const lg = a && a.login;
+  if (!lg) return true;
+  const since = lg.finished_at ?? lg.started_at;
+  return a.taken_at != null && since != null && a.taken_at >= since;
 }
 
 // ---- バー -----------------------------------------------------------------

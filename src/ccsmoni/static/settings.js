@@ -12,7 +12,7 @@ import { h, setChildren, spinner, toast, statusChip, bar, fmtPct, readableColor,
 let keySeq = 0;
 const newKey = () => `k${++keySeq}`;
 const clone = (o) => JSON.parse(JSON.stringify(o));
-const PALETTE = ["#4f8cff", "#e8833a", "#2bb673", "#a86ad9", "#e05a8a", "#1fb5c2", "#c9a227", "#7a8699"];
+const HEX = /^#[0-9a-f]{6}$/i;
 
 // 保存用に、画面だけの印（_key）を外す
 function strip(form) {
@@ -25,6 +25,12 @@ export function createSettings(ctx) {
   const st = {
     loading: false, loadError: null,
     hash: null, path: null, fileError: null, candidates: [],
+    // 色はサーバーが決める（推移画面の色と一致させるため）。palette: 選べる色、colors: id → 解決済みの色
+    palette: [], colors: {},
+    historyIds: new Set(),    // 履歴があるアカウントの id（新しい id が重なったら注意を出す）
+    readonly: null,           // claude_path / host / port（画面では変えられない。設定ファイルで編集する）
+    knownHashes: new Set(),   // この画面で読み込んだ・保存した hash（state の config_hash がこれ以外なら外部の変更）
+    external: false,          // 編集中に、設定ファイルが外部で変更された
     form: null, baseline: null,
     open: null,               // 開いている行の _key（1行だけ開く。もう一度押すと閉じる）
     newKeys: new Set(),       // この画面で追加した行（id を編集できる）
@@ -35,20 +41,28 @@ export function createSettings(ctx) {
     confirmDelete: null,      // 削除の確認を出している行の _key
     dragKey: null,
   };
-  let root = null, statusEl = null, saveBtn = null, revertBtn = null;
+  let root = null, statusEl = null, saveBtn = null, revertBtn = null, bannersEl = null;
 
   const isDirty = () => !!(st.form && st.baseline !== JSON.stringify(strip(st.form)));
 
   // ---- 読み込み ------------------------------------------------------------------
-  async function load() {
+  // keepOpen: 外部の変更を自動で読み込み直すとき、開いていた行（id で探す）を開いたままにする
+  async function load({ keepOpen = false } = {}) {
+    const openId = keepOpen && st.form ? (st.form.accounts.find((a) => a._key === st.open) || {}).id : null;
     st.loading = true;
     render();
     try {
       const r = await api.getConfig();
       st.hash = r.hash;
+      st.knownHashes.add(r.hash);
       st.path = r.path;
       st.fileError = r.error;
       st.candidates = r.candidates || [];
+      // 以下は新しいサーバーだけが返す。無ければ空として扱う
+      st.palette = Array.isArray(r.palette) ? r.palette.filter((c) => HEX.test(c)) : [];
+      st.colors = r.colors && typeof r.colors === "object" ? r.colors : {};
+      st.historyIds = new Set(Array.isArray(r.history_ids) ? r.history_ids : []);
+      st.readonly = r.readonly && typeof r.readonly === "object" ? r.readonly : null;
       st.form = clone(r.config);
       for (const a of st.form.accounts) a._key = newKey();
       st.baseline = JSON.stringify(strip(st.form));
@@ -56,8 +70,9 @@ export function createSettings(ctx) {
       st.errors.clear();
       st.generalErrors = [];
       st.conflict = false;
+      st.external = false;
       st.saveError = null;
-      st.open = null;
+      st.open = openId ? (st.form.accounts.find((a) => a.id === openId) || {})._key || null : null;
       st.loadError = null;
     } catch (e) {
       st.loadError = e.message;
@@ -77,6 +92,9 @@ export function createSettings(ctx) {
       const body = strip(st.form);
       const r = await api.putConfig(body, st.hash);
       st.hash = r.hash;
+      st.knownHashes.add(r.hash);
+      st.external = false;
+      st.fileError = null; // 保存でファイルを書き直したので、誤りは直っている（state の config_error も次の取得で消える）
       st.baseline = JSON.stringify(body);
       st.newKeys.clear();
       st.errors.clear();
@@ -84,6 +102,10 @@ export function createSettings(ctx) {
       st.restartRequired = st.restartRequired || !!r.restart_required;
       st.justSaved = true;
       toast("保存しました。すぐに反映されます", "ok");
+      // スキーマに無いキーを取り除いた・壊れていたファイルを控えに残した、は保存とは別に知らせる
+      const removed = Array.isArray(r.removed_keys) ? r.removed_keys : [];
+      if (removed.length) toast(`設定ファイルにあった不明な項目を取り除きました: ${removed.join("、")}`, "warn", 7000);
+      if (r.backup_path) toast(`誤りのあった設定ファイルは控えを残しました: ${r.backup_path}`, "info", 7000);
       ctx.refreshState();
       render();
     } catch (e) {
@@ -122,7 +144,9 @@ export function createSettings(ctx) {
     "server.port": "ポート", "server.host": "ホスト", "collector.discover_roots": "探す場所",
     "collector.claude_path": "claude の場所", "ui": "色のしきい値", "accounts": "アカウント",
   };
-  const fieldExists = (f) => f in GLOBAL_FIELDS && f !== "accounts";
+  // 画面に入力欄があるもの（claude_path / host / port は読み取り専用なので、エラーは保存バーの一覧に出す）
+  const READONLY_FIELDS = new Set(["server.port", "server.host", "collector.claude_path"]);
+  const fieldExists = (f) => f in GLOBAL_FIELDS && f !== "accounts" && !READONLY_FIELDS.has(f);
   const labelFor = (f) => GLOBAL_FIELDS[f] || f;
 
   // ---- 画面の骨組み -------------------------------------------------------------------
@@ -139,7 +163,27 @@ export function createSettings(ctx) {
   function onKey(e) {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); }
   }
-  function onState() { /* 設定画面はサーバーの状態の更新では作り直さない（編集中のため） */ }
+  // 設定画面はサーバーの状態の更新では作り直さない（編集中のため）。
+  // ただし設定ファイルが外部で変更されたら（state の config_hash が、ここで読み込んだ・保存したどれとも違う）、
+  // 未編集なら黙って読み込み直し、編集中なら帯で知らせる。古いサーバーは config_hash を返さないので何もしない。
+  let lastExternalHash = null;
+  function onState(s) {
+    renderBanners();
+    const h2 = s && s.config_hash;
+    if (!root || !h2 || !st.form || st.loading || st.saving) return;
+    if (st.knownHashes.has(h2) || h2 === lastExternalHash) return;
+    lastExternalHash = h2; // 読み込み直しても hash が合わない場合（壊れたファイル等）に、繰り返さないように
+    if (!isDirty()) {
+      // 中身が同じだった（hash の付け方の違いだけ等）なら、知らせない
+      const before = st.baseline;
+      load({ keepOpen: true }).then(() => {
+        if (!st.loadError && st.baseline !== before) toast("設定ファイルの変更を読み込みました", "info");
+      });
+    } else if (!st.external) {
+      st.external = true;
+      renderBanners();
+    }
+  }
 
   function render() {
     if (!root) return;
@@ -150,8 +194,10 @@ export function createSettings(ctx) {
       return;
     }
     const f = st.form;
+    bannersEl = h("div.settings-banners");
+    renderBanners();
     setChildren(root, ...[
-      st.fileError ? h("div.banner.tone-warn", ["設定ファイルに誤りがあります: ", st.fileError]) : null,
+      bannersEl,
       st.restartRequired ? h("div.banner.tone-info", "ホスト・ポートの変更は、ccsmoni を再起動すると反映されます。") : null,
       accountsPanel(f),
       candidatesPanel(),
@@ -160,6 +206,22 @@ export function createSettings(ctx) {
       saveBar(),
     ].filter(Boolean));
     updateStatus();
+  }
+
+  // 画面の上の帯。state が来るたびにも呼ぶ（フォームは作り直さない）。
+  // 設定ファイルの誤りは、アプリ全体の帯（app.js）ではなくここで1つだけ出す。
+  function renderBanners() {
+    if (!bannersEl) return;
+    const fileError = st.fileError || (ctx.store.server && ctx.store.server.config_error);
+    setChildren(bannersEl,
+      st.external ? h("div.banner.tone-warn", [h("b", "設定ファイルが外部で変更されました。"), " ",
+        h("button.btn.btn-sm", { type: "button", onclick: () => {
+          if (confirm("読み込み直すと、この画面の変更は破棄されます。よろしいですか？")) load({ keepOpen: true });
+        } }, "読み込み直す")]) : null,
+      fileError ? h("div.banner.tone-warn", [h("b", "設定ファイルに誤りがあります。"),
+        " 最後に有効だった設定で動いています。保存すると、この画面の内容でファイルを書き直します。 ",
+        h("span.banner-detail", fileError)]) : null,
+    );
   }
 
   // ---- 保存バー（画面の下に固定） --------------------------------------------------------
@@ -231,12 +293,13 @@ export function createSettings(ctx) {
       },
     });
   }
-  function numInput(obj, key, { placeholder = "", nullable = false, errKey, min, max, unit, onInput } = {}) {
+  function numInput(obj, key, { placeholder = "", errKey, min, max, unit, onInput } = {}) {
     const input = h("input", {
       type: "number", inputmode: "numeric", value: obj[key] ?? "", placeholder, min, max,
       oninput: (e) => {
         const v = e.target.value.trim();
-        obj[key] = v === "" ? (nullable ? null : null) : Number(v);
+        // 空欄は null（nullable な項目は「既定を使う」、そうでない項目はサーバーの検証で「入力してください」になる）
+        obj[key] = v === "" ? null : Number(v);
         onInput && onInput();
         changed(errKey);
       },
@@ -259,12 +322,22 @@ export function createSettings(ctx) {
     ]);
   }
 
+  // 色が空欄（自動）のときに実際に使われる色。サーバーが解決した色（推移画面と同じ）を優先し、
+  // 無ければ（新しい行・古いサーバー）推移画面の state の色、最後にパレットの順番で決める。
+  function autoColor(a, i) {
+    if (a.id && HEX.test(st.colors[a.id] || "")) return st.colors[a.id];
+    const live = a.id && ctx.store.server && ctx.store.server.accounts.find((x) => x.id === a.id);
+    if (live && HEX.test(live.color || "")) return live.color;
+    return st.palette.length ? st.palette[i % st.palette.length] : null;
+  }
+
   function accountRow(a, i, f) {
     const k = a._key;
     const open = st.open === k;
     const isNew = st.newKeys.has(k);
     const bg = cssVar("--surface") || "#fff";
-    const color = a.color && /^#[0-9a-f]{6}$/i.test(a.color) ? a.color : null;
+    const explicit = a.color && HEX.test(a.color) ? a.color : null;
+    const color = explicit || autoColor(a, i);
     const nameEl = h("span.acct-name", a.label || "（名前なし）");
     const rowErr = [...st.errors.keys()].some((x) => x.startsWith(`acct:${k}:`));
 
@@ -276,7 +349,8 @@ export function createSettings(ctx) {
       h("span.drag-handle", { title: "ドラッグで並べ替え", "aria-hidden": "true",
         onmousedown: (e) => { e.currentTarget.closest(".acct-row").draggable = true; },
         onclick: (e) => e.stopPropagation() }, "⋮⋮"),
-      h("span.sw", { style: { background: color ? readableColor(color, bg) : "transparent" }, class: color ? "" : "is-auto" }),
+      h("span.sw", { style: { background: color ? readableColor(color, bg) : "transparent" }, class: explicit ? "" : "is-auto",
+        title: explicit ? null : "自動で決めた色" }),
       h("span.acct-title", [nameEl, h("span.acct-id.mono", a.id || "（id 未入力）")]),
       rowErr ? h("span.chip.tone-danger", "要修正") : null,
       isNew ? h("span.chip.tone-info", "新規") : null,
@@ -335,8 +409,8 @@ export function createSettings(ctx) {
     const ek = (name) => `acct:${k}:${name}`;
     const head = () => root.querySelector(`.acct-row[data-key="${k}"]`);
     const colorText = textInput(a, "color", { placeholder: "自動", nullable: true, errKey: ek("color"), mono: true,
-      onInput: (v) => { if (/^#[0-9a-f]{6}$/i.test(v)) { picker.value = v; paintSwatch(v); } } });
-    const picker = h("input.color-picker", { type: "color", value: a.color && /^#[0-9a-f]{6}$/i.test(a.color) ? a.color : PALETTE[i % PALETTE.length],
+      onInput: (v) => { if (HEX.test(v)) { picker.value = v; paintSwatch(v); } } });
+    const picker = h("input.color-picker", { type: "color", value: (a.color && HEX.test(a.color) ? a.color : autoColor(a, i)) || "#888888",
       "aria-label": "色を選ぶ",
       oninput: (e) => { a.color = e.target.value; colorText.value = a.color; paintSwatch(a.color); changed(ek("color")); } });
     const paintSwatch = (c) => {
@@ -345,9 +419,17 @@ export function createSettings(ctx) {
     };
     const test = st.tests.get(k);
 
+    // 新しい id が過去の履歴の id と同じなら、続きとして記録される（エラーではないので、注意だけ出す）
+    const histNote = h("span.field-note.tone-text-warn", { hidden: true }, "この id には過去の履歴があります。同じアカウントなら続きとして記録されます。");
+    // いま一覧にある別の行と同じ id なら、それは重複のエラー（保存時に 422）なので、この注意は出さない
+    const paintHistNote = (v) => {
+      const id = (v || "").trim();
+      histNote.hidden = !(id && st.historyIds.has(id) && !st.form.accounts.some((x) => x !== a && x.id === id));
+    };
+    if (isNew) paintHistNote(a.id);
     const idField = isNew
-      ? field("id", textInput(a, "id", { errKey: ek("id"), mono: true, placeholder: "acct-x",
-          onInput: (v) => { const el = head()?.querySelector(".acct-id"); if (el) el.textContent = v || "（id 未入力）"; } }),
+      ? field("id", [textInput(a, "id", { errKey: ek("id"), mono: true, placeholder: "acct-x",
+          onInput: (v) => { const el = head()?.querySelector(".acct-id"); if (el) el.textContent = v || "（id 未入力）"; paintHistNote(v); } }), histNote],
         { errKey: ek("id"), help: "履歴を記録するときの名前です。英数字・ - ・ _ で。保存したあとは変えられません。" })
       : h("div.field", [h("span.field-label", "id"), h("code.readonly", a.id), h("span.field-help", "履歴のキーなので変えられません。")]);
 
@@ -362,8 +444,8 @@ export function createSettings(ctx) {
         field("起動コマンド", textInput(a, "launch_command", { nullable: true, errKey: ek("launch_command"), mono: true, placeholder: "例: claude-acct-a" }),
           { errKey: ek("launch_command"), help: "ログインの案内とコピー用です。ccsmoni が実行することはありません。" }),
         field("色", h("span.color-row", [picker, colorText,
-          h("span.palette", PALETTE.map((c) => h("button.pal", { type: "button", style: { background: c }, title: c, "aria-label": `色 ${c}`,
-            onclick: (e) => { e.preventDefault(); a.color = c; colorText.value = c; picker.value = c; paintSwatch(c); changed(ek("color")); } })))]),
+          st.palette.length ? h("span.palette", st.palette.map((c) => h("button.pal", { type: "button", style: { background: c }, title: c, "aria-label": `色 ${c}`,
+            onclick: (e) => { e.preventDefault(); a.color = c; colorText.value = c; picker.value = c; paintSwatch(c); changed(ek("color")); } }))) : null]),
           { errKey: ek("color"), div: true, help: "空欄なら自動で決めます。" }),
         field("取得間隔", numInput(a, "interval_minutes", { nullable: true, errKey: ek("interval_minutes"), min: 1, max: 1440, unit: "分",
           placeholder: `既定（${f.collector.default_interval_minutes ?? 10}）` }),
@@ -391,12 +473,14 @@ export function createSettings(ctx) {
       const r = await api.testAccount(a.config_dir);
       st.tests.set(k, { result: r });
     } catch (e) {
-      st.tests.set(k, { error: e.message });
+      // 429: 別の接続テストがまだ実行中（サーバーは1つずつしか動かさない）
+      st.tests.set(k, e.status === 429 ? { busy: true } : { error: e.message });
     }
     render();
   }
   function testResult(t) {
     if (!t || t.loading) return null;
+    if (t.busy) return h("span.test-result", [h("span.chip.tone-warn", "実行中です"), h("span.muted", "別の接続テストが終わってから、もう一度押してください。")]);
     if (t.error) return h("span.test-result", [statusChip("error"), h("span", t.error)]);
     const r = t.result;
     const ui = st.form.ui;
@@ -408,13 +492,14 @@ export function createSettings(ctx) {
 
   function addAccount(cand) {
     const f = st.form;
-    const used = new Set(f.accounts.map((a) => a.color));
+    // 使われている色（自動で決まった色も含む）と重ならない、パレットの最初の色。パレットが無ければ自動に任せる
+    const used = new Set(f.accounts.map((a, i) => (a.color && HEX.test(a.color) ? a.color : autoColor(a, i)) || "").map((c) => c.toLowerCase()));
     const a = {
       id: cand ? uniqueId(cand.suggested_id) : "",
       label: cand ? cand.suggested_id : "",
       config_dir: cand ? cand.config_dir : "",
       launch_command: null,
-      color: PALETTE.find((c) => !used.has(c)) || null,
+      color: st.palette.find((c) => !used.has(c.toLowerCase())) || null,
       interval_minutes: null,
       enabled: true,
       _key: newKey(),
@@ -461,6 +546,17 @@ export function createSettings(ctx) {
     ]);
   }
 
+  // ---- 読み取り専用の項目 -------------------------------------------------------------
+  // claude の場所・ホスト・ポートは、画面からは変えられない（ネットワークに出す設定や実行するファイルなので、
+  // ファイルを直接編集したときだけ変わるようにする）。古いサーバーは readonly を返さないので、設定の値で代用する。
+  function readonlyFields(c, sv) {
+    const ro = st.readonly || { claude_path: c.claude_path, host: sv && sv.host, port: sv && sv.port };
+    const show = (v) => (v == null || v === "" ? "（自動）" : String(v));
+    const item = (label, v) => h("div.field", [h("span.field-label", label), h("code.readonly.mono", show(v)),
+      h("span.field-help", "設定ファイルで編集できます。")]);
+    return [item("claude の場所", ro.claude_path), item("ホスト", ro.host), item("ポート", ro.port)];
+  }
+
   // ---- 全体設定 ----------------------------------------------------------------------
   function globalPanel(f) {
     const c = f.collector, ui = f.ui, sv = f.server;
@@ -499,9 +595,7 @@ export function createSettings(ctx) {
       h("details.advanced", [
         h("summary", "詳細"),
         h("div.form-grid", [
-          field("ホスト", textInput(sv, "host", { errKey: "server.host", mono: true }), { errKey: "server.host", help: "再起動すると反映されます。" }),
-          field("ポート", numInput(sv, "port", { min: 1, max: 65535, errKey: "server.port" }), { errKey: "server.port", help: "再起動すると反映されます。" }),
-          field("claude の場所", textInput(c, "claude_path", { errKey: "collector.claude_path", mono: true }), { errKey: "collector.claude_path" }),
+          ...readonlyFields(c, sv),
           field("アカウントを探す場所", h("textarea.mono", { rows: 2, spellcheck: "false", value: (c.discover_roots || []).join("\n"),
             oninput: (e) => { c.discover_roots = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean); changed("collector.discover_roots"); } }),
             { errKey: "collector.discover_roots", wide: true, help: "1行に1つ。この下にある Claude の設定フォルダを候補として出します。" }),
