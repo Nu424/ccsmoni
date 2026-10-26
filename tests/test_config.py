@@ -68,9 +68,10 @@ def test_initial_generation_discovers(tmp_path):
     loaded, _ = svc.load()  # ファイルが無いので初期生成される
     assert len(loaded.accounts) == 1  # node_modules の中には入らない
     a = loaded.accounts[0]
-    assert a.id == "conf-one" and a.label == "conf-one" and a.color == "#4f8cff"
+    assert a.id == "conf-one" and a.label == "conf-one" and a.color == 0
     assert a.expanded_dir() == roots / ".conf one"
-    assert "取得間隔（分）" in svc.path.read_text(encoding="utf-8")
+    text = svc.path.read_text(encoding="utf-8")
+    assert "取得間隔（分）" in text and "tiles_per_page = 6" in text and "1ページに並べるタイル" in text
     # 登録済みは候補から外れる
     assert svc.discover_candidates(loaded) == []
 
@@ -153,6 +154,21 @@ def test_validation_errors(svc):
         svc.save({**base, "accounts": [bad]}, h)
     assert e.value.errors[0][0] == "accounts.0.color"
     assert "#rrggbb" in e.value.errors[0][1]
+
+    # 色の番号は 0〜6 の整数。範囲外・bool・小数・番号を表す文字列は弾く
+    for v in (7, -1, True, 1.5, "3"):
+        with pytest.raises(ConfigValidationError) as e:
+            svc.save({**base, "accounts": [dict(base["accounts"][0], color=v)]}, h)
+        assert e.value.errors[0][0] == "accounts.0.color", v
+
+    # tiles_per_page は 4/6/8/9/12 のどれか
+    assert AppConfig().ui.tiles_per_page == 6
+    for v in (5, 0, 13, 6.5):
+        with pytest.raises(ConfigValidationError) as e:
+            svc.save({**base, "ui": {"tiles_per_page": v}}, h)
+        assert e.value.errors[0][0] == "ui.tiles_per_page", v
+    for v in (4, 6, 8, 9, 12):
+        assert AppConfig.model_validate({"ui": {"tiles_per_page": v}}).ui.tiles_per_page == v
 
     bad = dict(base["accounts"][0], id="bad id!")
     with pytest.raises(ConfigValidationError):
@@ -331,17 +347,66 @@ def test_load_regenerates_empty_file(tmp_path):
 # ---------------------------------------------------------------- 色・パス表記
 
 
-def test_resolve_colors():
-    accounts = AppConfig.model_validate({"accounts": [
-        {"id": "a", "label": "a", "config_dir": "x", "color": "#4F8CFF"},
-        {"id": "b", "label": "b", "config_dir": "x"},
-        {"id": "c", "label": "c", "config_dir": "x"},
+def _accts(*colors):
+    return AppConfig.model_validate({"accounts": [
+        {"id": f"a{i}", "label": "x", "config_dir": "x", **({} if c is None else {"color": c})}
+        for i, c in enumerate(colors)
     ]}).accounts
-    colors = resolve_colors(accounts, ["z", "y", "a"])
-    assert colors["a"] == "#4F8CFF" and colors["b"] == PALETTE[1] and colors["c"] == PALETTE[2]
-    # アーカイブは id の昇順に、まだ使われていない色から
-    assert colors["y"] == PALETTE[3] and colors["z"] == PALETTE[4]
+
+
+def test_palette_shape():
+    assert len(PALETTE["light"]) == len(PALETTE["dark"]) == 7
+    assert all(len(c) == 7 and c.startswith("#") for c in PALETTE["light"] + PALETTE["dark"])
+
+
+def test_resolve_colors_auto_slot_hex():
+    # 自動は並び順の番号。hex は (None, hex)、整数はその番号（色は None）
+    colors = resolve_colors(_accts("#4F8CFF", None, None, 5))
+    assert colors["a0"] == (None, "#4F8CFF")
+    assert colors["a1"] == (1, None) and colors["a2"] == (2, None)
+    assert colors["a3"] == (5, None)
+    # 全部自動なら 0,1,2,...。7件を超えたら巡回して重複を許す
+    colors = resolve_colors(_accts(*[None] * 9))
+    assert [colors[f"a{i}"][0] for i in range(9)] == [0, 1, 2, 3, 4, 5, 6, 0, 1]
+
+
+def test_resolve_colors_avoids_explicit_slots():
+    # 後ろのアカウントが明示した番号も、先の自動は避ける。次の空き番号（巡回）にずらす
+    colors = resolve_colors(_accts(None, None, 1, 0))
+    assert colors["a2"] == (1, None) and colors["a3"] == (0, None)
+    assert colors["a0"] == (2, None) and colors["a1"] == (3, None)
+    # 明示の番号が6のとき、自動は 6 を避けて 0〜5 を使う
+    colors = resolve_colors(_accts(6, None, None, None, None, None, None))
+    assert colors["a0"] == (6, None)
+    assert sorted(colors[f"a{i}"][0] for i in range(1, 7)) == [0, 1, 2, 3, 4, 5]
+
+
+def test_resolve_colors_archived():
+    accounts = _accts(0, None, "#112233")  # 使用中の番号: 0 と 自動の 1
+    colors = resolve_colors(accounts, ["z", "y", "a0"])
+    assert colors["a1"] == (1, None)
+    # アーカイブは id の昇順に、設定のアカウントが使っていない番号から（2,3,...）。設定にある a0 は対象外
+    assert colors["y"] == (2, None) and colors["z"] == (3, None)
     assert resolve_colors(accounts, ["z", "y"]) == colors  # 決定的
+    # 番号が全部使われていれば全体から
+    full = resolve_colors(_accts(0, 1, 2, 3, 4, 5, 6), ["q", "p"])
+    assert full["p"] == (0, None) and full["q"] == (1, None)
+
+
+def test_color_int_roundtrip_in_toml(tmp_path):
+    svc = ConfigService(tmp_path / "config.toml", discover_roots=[])
+    write(svc, HAND_WRITTEN)
+    cfg, h = svc.load()
+    d = cfg.model_dump()
+    d["accounts"][0]["color"] = 3
+    svc.save(d, h)
+    text = svc.path.read_text(encoding="utf-8")
+    assert "color = 3" in text and '"3"' not in text  # 整数のまま保存される
+    assert svc.load()[0].accounts[0].color == 3
+    d = svc.current.model_dump()
+    d["accounts"][0]["color"] = "#abcdef"
+    svc.save(d, svc.current_hash)
+    assert svc.load()[0].accounts[0].color == "#abcdef"
 
 
 def test_short_path(tmp_path):

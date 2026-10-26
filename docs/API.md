@@ -25,7 +25,11 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
     "last_run_at": 1793065400,        // 最後にどれかのアカウントを取得し終えた時刻
     "next_run_at": 1793066200         // 次にどれかのアカウント（取得中・順番待ちのものを除く）を取得する予定の時刻。無ければ null
   },
-  "ui": { "warn_percent": 70, "danger_percent": 90 },
+  "ui": { "warn_percent": 70, "danger_percent": 90, "tiles_per_page": 6 },   // tiles_per_page: 1ページのタイル数（4 / 6 / 8 / 9 / 12）
+  "palette": {                        // アカウントの色のパレット（検証済みの7色。番号 = 配列の添字）。UI はテーマに応じて light / dark を使う
+    "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],
+    "dark":  ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
+  },
   "config_error": null,               // 設定ファイルが壊れている・空・見つからないときは説明文（最後に有効だった設定で動き続ける）
   "config_hash": "<sha256>",          // いまの設定ファイルの内容の hash（壊れていても・無くても計算する）。
                                       // 設定画面は、読み込んだときの hash と違えば「外部で変更されました」と出せる
@@ -33,7 +37,8 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
     {
       "id": "acct-a",
       "label": "個人",
-      "color": "#4f8cff",             // 解決済みの色（下記「色の割り当て」）。未設定でも必ず入る
+      "color_slot": 0,                // パレットの番号（0〜6）。独自の色（#rrggbb）を指定しているときは null。自動の割り当てでも必ず入る
+      "color": null,                  // 独自の色（"#rrggbb"）を指定しているときだけ。それ以外は null（下記「色の割り当て」）
       "enabled": true,
       "launch_command": "claude-acct-a",   // null 可
       "interval_minutes": 10,         // 実際に使われる間隔（既定値の解決済み）
@@ -41,6 +46,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
       "status": "ok",                 // ok | logged_out | error | timeout | parse_error | never（まだ一度も取得していない）
       "message": null,
       "taken_at": 1793065400,
+      "status_since": null,           // ok 以外の状態が続いているとき、その開始時刻（直近の ok の後の、最初の ok 以外の取得の時刻。一度も ok がなければ最初の取得）。ok・never は null
       "stale": false,                 // 最終取得が interval の 3 倍より古い。enabled=false のアカウントは常に false
       "plan": "max",                  // null 可
       "limits": [                     // status=ok のときの値。ok 以外では []
@@ -58,6 +64,10 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
       "last_ok": {                    // ok 以外のときに「最後にわかった値」を薄く表示するため。ok のときは null
         "taken_at": 1793000000, "limits": [ /* limits と同じ形 */ ]
       },
+      "weekly_peaks": [               // 週間（weekly_all）の直近6枠、古い順。タイルのミニ柱用（/api/windows を別に呼ばなくてよい）。枠が無ければ []
+        { "resets_at": 1792600000, "peak_percent": 63.0, "current": false },
+        { "resets_at": 1793200000, "peak_percent": 41.0, "current": true }   // current: 今の limits の weekly_all と同じ枠（ok でないとき・枠が始まっていないときはすべて false）
+      ],
       "login": {                      // ログインの進行状態。何もしていなければ（または終わって 10 分たてば）null
         "state": "waiting",           // waiting | done | mismatch | failed | timeout
         "started_at": 1793065000,
@@ -71,7 +81,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
     }
   ],
   "archived": [                       // 履歴はあるが、設定にないアカウント（削除したもの）。id の昇順
-    { "id": "acct-old", "label": "acct-old", "color": "#17c964" }   // label は id。color は下記「色の割り当て」
+    { "id": "acct-old", "label": "acct-old", "color_slot": 3, "color": null }   // label は id。色は下記「色の割り当て」（accounts と同じ形）
   ],
   "candidates": [                     // 未登録のアカウント候補（設定画面と、トップの控えめな通知に使う）
     { "suggested_id": "acct-x", "config_dir": "~/somewhere/acct-x" }
@@ -81,13 +91,19 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
 
 ### 色の割り当て
 
-`/api/state`（accounts・archived）と `/api/config`（colors）は、サーバーの同じ関数（`config.resolve_colors`）で色を決める。UI は自分で色を決めず、これを使う。
-- 設定のアカウント: `color` の指定があればその色。なければ設定の並び順で `palette[index % palette.length]`。
-- アーカイブ: id の昇順に、設定のアカウントが使っていないパレットの色から順に割り当てる（全部使われていればパレット全体から順に）。
+`/api/state`（accounts・archived）と `/api/config`（slots）は、サーバーの同じ関数（`config.resolve_colors`）で色を決め、`(color_slot, color)` の組で返す。UI は自分で色を決めず、これを使う。
+- 設定の `accounts[].color`:
+  - 整数 0〜6: その番号のパレット色。`color_slot` = その番号、`color` = null。
+  - `"#rrggbb"`: 独自の色。`color_slot` = null、`color` = その hex（light / dark の両方でこの色を使う）。
+  - 省略（自動）: 設定の並び順 i に対して `i % 7` 番を第一候補にし、ほかのアカウントが明示した番号や先に自動で割り当てた番号と重なるときは、次の空き番号（巡回）にする。7件を超えて空きがなければ第一候補のまま（重複を許す）。`color_slot` = 割り当てた番号、`color` = null。
+- アーカイブ: id の昇順に、設定のアカウントが使っていない番号から順に割り当てる（全部使われていれば全体から順に）。
+- 色の指定が不正（範囲外の整数・bool・小数・hex でない文字列）なら、設定の保存・読み込みで検証エラー。
 
 ## GET /api/history?range=7d&kinds=weekly_all,session&accounts=a,b
 
 - `range`: `24h` | `7d` | `30d`（既定は `7d`）。`kinds` と `accounts` は省略すると全部。
+- `since` / `until`（epoch 秒）: 任意の範囲で取る。**両方指定したら `range` より優先**する（`range` は検証もしない）。応答の `since` / `until` はこの値そのまま。`gaps`・`resets`・`errors` も指定した範囲で数える。
+  - 範囲は最大 120 日（`until - since` が 120 日を超えたら 422）。`since >= until`、片方だけの指定、0〜2100 年の外の値も 422。
 - 線は枠（window）ごとに分けて返す。リセットをまたいで線をつながないため。
 
 ```jsonc
@@ -135,14 +151,18 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
 { "config": { /* AppConfig を JSON にしたもの（collector / server / ui / accounts）。server.allowed_hosts を含む */ },
   "hash": "<sha256>", "path": "~/AppData/Local/ccsmoni/config.toml", "error": null,
   "candidates": [ /* /api/state と同じ */ ],
-  "palette": ["#4f8cff", "#f5a524", "#17c964", "#f31260", "#9353d3", "#06b7db", "#f56d3b", "#7c8aa5"],  // サーバーと同じパレット
-  "colors": { "acct-a": "#4f8cff", "acct-b": "#f5a524" },   // 設定のアカウントの解決済みの色（色が未設定のものも含む）
+  "palette": { "light": ["#2a78d6", /* …7色 */], "dark": ["#3987e5", /* …7色 */] },   // /api/state と同じパレット
+  "slots": {                                                // 設定のアカウントの解決済みの色（色が未設定のものも含む。設定画面の色見本用）
+    "acct-a": { "color_slot": 0, "color": null },
+    "acct-b": { "color_slot": null, "color": "#112233" }
+  },
   "history_ids": ["acct-a", "acct-b", "acct-old"],          // DB に履歴がある id（昇順）。新しいアカウントの id がこれと重なれば
                                                              // UI は「この id には過去の履歴があります」と警告する
   "readonly": { "claude_path": "claude", "host": "127.0.0.1", "port": 8484 }   // ファイルでだけ編集できる項目（UI は表示だけ）
 }
 ```
 
+- 設定の `ui.tiles_per_page` は 4 / 6 / 8 / 9 / 12 のどれか（既定 6）。`accounts[].color` は省略 / 整数 0〜6 / `"#rrggbb"`（`"red"` や `7` は 422。メッセージは「色は 0〜6 の番号か #rrggbb の形式で指定してください」）。
 - `path`（と `candidates[].config_dir`、PUT の `backup_path`）はホーム配下なら `~/` で短縮し、区切りは `/` にそろえる（例 `~/AppData/Local/ccsmoni/config.toml`。画面やスクリーンショットにユーザー名を出さないため）。
 - 設定ファイルが壊れている（TOML として読めない・検証に通らない・空・見つからない）ときは、`config` は最後に有効だった設定、`error` はその説明、
   `hash` は**そのときのファイル（壊れた内容）の hash** を返す。画面から保存すれば直せるようにするため
@@ -156,7 +176,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
   - `backup_path`: 既存のファイルが TOML の構文エラーだったときは、壊れたファイルを `config.toml.broken-<日時>` に退避し、新しい設定を初期生成と同じコメント付きの体裁で書き出す。その退避先（`~/` で短縮）。退避しなければ `null`
   - ファイルが空・見つからないときも、初期生成と同じ体裁で書き出す（退避はしない）
 - 409 `{"error": "設定ファイルが外部で変更されました", "hash": "<現在の hash>"}`（置き換える直前にもう一度 hash を確かめる。その間に変更されていても 409）
-- 422 `{"error": "入力内容に誤りがあります", "fields": [["accounts.0.color", "色は #rrggbb の形式で指定してください"]]}`
+- 422 `{"error": "入力内容に誤りがあります", "fields": [["accounts.0.color", "色は 0〜6 の番号か #rrggbb の形式で指定してください"]]}`
   - 書き出す予定の TOML 全体を、読み込みと同じ検証に通してから置き換える。通らなければ（例: 未知のセクションが残っている）422 で、ファイルは変わらない
 - 422 `{"error": "この項目は設定ファイルで編集してください", "fields": [["collector.claude_path", "この項目は設定ファイルで編集してください"]]}`
   - `collector.claude_path`・`server.host`・`server.port` は Web から変えられない（任意のコマンドの実行・外部への公開を防ぐため）。いまの値と違う値が来たら 422。省略すればいまの値のまま

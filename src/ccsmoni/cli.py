@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="架空の 4 アカウントの設定と 30 日分の合成履歴を作る（UI の確認用）")
     demo.add_argument("--home", required=True, help="作成先のディレクトリ（serve するときは CCSMONI_HOME にこれを指定）")
     demo.add_argument("--days", type=float, default=30, help="履歴の日数（既定 30。小数も可: 0.05 ≒ 1 時間。記録を始めたばかりの画面の確認用）")
+    demo.add_argument("--accounts", type=int, default=4, choices=range(4, 13), metavar="N", help="アカウント数（4〜12。既定 4。タイルの並べ方の確認用に、架空の名前で増やす）")
     demo.add_argument("--force", action="store_true", help="既存のデモを作り直す")
     return p
 
@@ -147,7 +148,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
     home = Path(args.home).expanduser().resolve()
     try:
-        counts = create_demo_home(home, days=args.days, force=args.force)
+        counts = create_demo_home(home, days=args.days, force=args.force, accounts=args.accounts)
     except FileExistsError as e:
         print(str(e), file=sys.stderr)
         return 1

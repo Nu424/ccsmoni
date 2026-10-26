@@ -87,7 +87,7 @@ ccsmoni.bat --setup-tailscale
 | `ccsmoni parse <file>` | 保存した `/usage` のテキストをパースして JSON で表示する |
 | `ccsmoni reparse` | 保存済みの生テキストから、DB の解釈結果を作り直す |
 | `ccsmoni tailscale-setup` | tailscale serve を設定する |
-| `ccsmoni demo --home <dir>` | 架空のアカウントと30日分の合成履歴を作る（UI の確認用。`CCSMONI_HOME=<dir> ccsmoni serve --demo` で表示する） |
+| `ccsmoni demo --home <dir> [--accounts N]` | 架空のアカウント（既定4件。`--accounts` で4〜12件）と30日分の合成履歴を作る（UI の確認用。`CCSMONI_HOME=<dir> ccsmoni serve --demo` で表示する） |
 
 コマンドは `uv run ccsmoni ...` の形で実行します。
 

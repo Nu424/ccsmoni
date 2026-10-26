@@ -1,6 +1,6 @@
 """デモ用の架空データ。
 
-何を: 架空の 4 アカウント（acct-a〜acct-d）の設定と、30 日分の合成履歴を入れた DB を作る（`ccsmoni demo --home <dir>`）。
+何を: 架空の 4 アカウント（acct-a〜acct-d。--accounts で最大 12 まで増やせる）の設定と、30 日分の合成履歴を入れた DB を作る（`ccsmoni demo --home <dir>`）。
       `ccsmoni serve --demo` では、実際の claude を呼ばずに同じモデルの続きを返す偽の Source を使う。
 なぜ: 実アカウントを使わずに UI を確認・撮影できるようにするため（スクリーンショットに機密が写らない）。
 方針:
@@ -41,7 +41,7 @@ class DemoSpec:
     id: str
     label: str
     plan: str
-    color: str
+    color: int | str | None  # 設定の color（None = 自動 / 整数 = パレットの番号 / "#rrggbb" = 独自の色）
     profile: str  # 利用の時間帯の傾向（_p_start を参照）
     intensity: float  # 使っている 10 分あたりの 5h 枠の増え方（%）
     weekly_ratio: float  # 5h 枠 1% あたりの週間枠の増え方（%）
@@ -54,15 +54,31 @@ class DemoSpec:
 
 SPECS: tuple[DemoSpec, ...] = (
     # 個人（Pro）: 夜型でよく使う。週間枠を使い切りそう → 「このペースだと…に上限」
-    DemoSpec("acct-a", "個人", "pro", "#4f8cff", "night_owl", 5.5, 0.065, 3.4 * 24, busy_now=True),
+    DemoSpec("acct-a", "個人", "pro", None, "night_owl", 5.5, 0.065, 3.4 * 24, busy_now=True),
     # 仕事（Max）: 平日の日中。モデル別の週間枠あり。取得間隔は 5 分
-    DemoSpec("acct-b", "仕事", "max", "#f5a524", "work", 3.2, 0.10, 5.2 * 24, model_week="Sonnet",
+    DemoSpec("acct-b", "仕事", "max", 4,  # 番号指定の例
+             "work", 3.2, 0.10, 5.2 * 24, model_week="Sonnet",
              busy_now=True, interval_minutes=5),
     # 検証用（Max）: たまにしか使わない。リセットが近いのに余っている → 「使わないと損」。途中でログイン切れ
-    DemoSpec("acct-c", "検証用", "max", "#17c964", "light", 2.5, 0.09, 20, logged_out=((-13 * 24, -10.5 * 24),)),
+    DemoSpec("acct-c", "検証用", "max", "#7c8aa5",  # 独自の色の例
+             "light", 2.5, 0.09, 20, logged_out=((-13 * 24, -10.5 * 24),)),
     # チーム（Team）: 平日の日中。いまログインが切れている
-    DemoSpec("acct-d", "チーム", "team", "#9353d3", "work", 3.5, 0.075, 2.4 * 24, logged_out=((-38, None),)),
+    DemoSpec("acct-d", "チーム", "team", None, "work", 3.5, 0.075, 2.4 * 24, logged_out=((-38, None),)),
 )
+
+
+# --accounts N（5〜12）で増やす架空のアカウント（タイルの並べ方の確認用）。先頭から必要な数だけ使う
+EXTRA_SPECS: tuple[DemoSpec, ...] = (
+    DemoSpec("acct-e", "研究", "max", None, "work", 3.0, 0.08, 1.6 * 24, model_week="Opus", busy_now=True),
+    DemoSpec("acct-f", "副業", "pro", None, "night_owl", 4.5, 0.07, 4.4 * 24),
+    DemoSpec("acct-g", "実験", "pro", None, "light", 2.0, 0.09, 6.1 * 24, busy_now=True),
+    DemoSpec("acct-h", "家族", "pro", None, "light", 1.5, 0.08, 2.9 * 24),
+    DemoSpec("acct-i", "学習", "max", None, "work", 2.8, 0.06, 0.8 * 24, interval_minutes=5),
+    DemoSpec("acct-j", "予備", "pro", None, "light", 1.2, 0.08, 5.6 * 24, logged_out=((-20, None),)),
+    DemoSpec("acct-k", "共有", "team", None, "work", 3.8, 0.09, 3.7 * 24, busy_now=True),
+    DemoSpec("acct-l", "夜勤", "max", None, "night_owl", 5.0, 0.10, 1.1 * 24),
+)
+MIN_ACCOUNTS, MAX_ACCOUNTS = len(SPECS), len(SPECS) + len(EXTRA_SPECS)
 
 
 def _seed(*parts: Any) -> int:
@@ -70,11 +86,11 @@ def _seed(*parts: Any) -> int:
 
 
 def _spec_for(account_id: str) -> DemoSpec:
-    for s in SPECS:
+    for s in SPECS + EXTRA_SPECS:
         if s.id == account_id:
             return s
     # 画面から足された・接続テストなど、知らない id は控えめな利用にする
-    return DemoSpec(account_id, account_id, "pro", "#7c8aa5", "light", 2.0, 0.08, 4 * 24)
+    return DemoSpec(account_id, account_id, "pro", None, "light", 2.0, 0.08, 4 * 24)
 
 
 # ---------------------------------------------------------------- 時間帯ごとの利用の傾向
@@ -295,14 +311,19 @@ class DemoConsole:
         return None
 
 
-DEMO_CANDIDATES = [{"suggested_id": "acct-e", "config_dir": "~/claude-demo/acct-e"}]
+DEMO_CANDIDATES = [{"suggested_id": "acct-new", "config_dir": "~/claude-demo/acct-new"}]  # --accounts で増やすアカウントと id が重ならないように
 
 
 # ---------------------------------------------------------------- ccsmoni demo --home
 
 
-def create_demo_home(home: Path, days: float = 30, force: bool = False, now: float | None = None) -> dict[str, int]:
-    """home に架空の設定と合成履歴の DB を作る。戻り値は件数の要約。"""
+def create_demo_home(
+    home: Path, days: float = 30, force: bool = False, now: float | None = None, accounts: int = MIN_ACCOUNTS
+) -> dict[str, int]:
+    """home に架空の設定と合成履歴の DB を作る。戻り値は件数の要約。accounts は 4〜12（4 を超えた分は EXTRA_SPECS）。"""
+    if not MIN_ACCOUNTS <= accounts <= MAX_ACCOUNTS:
+        raise ValueError(f"accounts は {MIN_ACCOUNTS}〜{MAX_ACCOUNTS} で指定してください")
+    specs = (SPECS + EXTRA_SPECS)[:accounts]
     from ccsmoni.config import AccountConfig, ConfigService
     from ccsmoni.parser_usage import UsageTextParser
     from ccsmoni.store import Store
@@ -334,7 +355,7 @@ def create_demo_home(home: Path, days: float = 30, force: bool = False, now: flo
             color=s.color,
             interval_minutes=s.interval_minutes,
         )
-        for s in SPECS
+        for s in specs
     ]
     svc.save(cfg, h)
 
@@ -343,7 +364,7 @@ def create_demo_home(home: Path, days: float = 30, force: bool = False, now: flo
     parser = UsageTextParser()
     counts: dict[str, int] = {}
     try:
-        for spec in SPECS:
+        for spec in specs:
             model = DemoModel(spec, anchor, start)
             rng = random.Random(_seed("snap", spec.id))
             step = (spec.interval_minutes or 10) * 60

@@ -19,6 +19,9 @@ def test_create_demo_home_and_live_source(tmp_path):
     cfg, _ = ConfigService(tmp_path / "config.toml").load()
     assert [a.id for a in cfg.accounts] == ["acct-a", "acct-b", "acct-c", "acct-d"]
     assert cfg.collector.discover_roots == []  # 実環境を走査しない
+    # 色: 自動・番号指定・独自の色の例が1件ずつ以上ある
+    assert [a.color for a in cfg.accounts] == [None, 4, "#7c8aa5", None]
+    assert cfg.ui.tiles_per_page == 6
 
     store = Store(tmp_path / "ccsmoni.db")
     try:
@@ -49,3 +52,18 @@ def test_create_demo_home_refuses_non_demo_dir(tmp_path):
         raise AssertionError("FileExistsError になるはず")
     except FileExistsError:
         pass
+
+
+def test_create_demo_home_more_accounts(tmp_path):
+    counts = demo.create_demo_home(tmp_path, days=0.2, now=ANCHOR, accounts=9)
+    assert len(counts) == 9 and "acct-i" in counts
+    cfg, _ = ConfigService(tmp_path / "config.toml").load()
+    assert len(cfg.accounts) == 9 and len({a.id for a in cfg.accounts}) == 9
+    # 未登録の候補の id は、増やしたアカウントと重ならない
+    assert {c["suggested_id"] for c in demo.DEMO_CANDIDATES}.isdisjoint(counts)
+    for bad in (3, 13):
+        try:
+            demo.create_demo_home(tmp_path, days=0.1, now=ANCHOR, accounts=bad, force=True)
+            raise AssertionError("ValueError になるはず")
+        except ValueError:
+            pass

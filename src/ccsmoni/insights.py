@@ -349,3 +349,23 @@ def window_peaks(
             ],
         })
     return rows
+
+
+def weekly_peaks(
+    windows: Sequence[Mapping[str, Any]], current_resets_at: float | None, limit: int = 6
+) -> list[dict[str, Any]]:
+    """1アカウント分の store.windows（weekly_all）から、/api/state の weekly_peaks を作る（直近 limit 枠、古い順）。
+
+    current は「今の limits の weekly_all と同じ枠」。resets_at が許容幅内の枠のうち最も新しい1つだけを true にする
+    （current_resets_at が None = ok でない・枠が始まっていないときは、すべて false）。
+    """
+    ws = sorted(windows, key=lambda w: (w["first_seen"], w["id"]))
+    cur_id = None
+    if current_resets_at is not None:
+        cur_id = next(
+            (w["id"] for w in reversed(ws) if abs(w["resets_at"] - current_resets_at) <= WINDOW_TOLERANCE_SEC), None
+        )
+    return [
+        {"resets_at": w["resets_at"], "peak_percent": w["peak_percent"], "current": w["id"] == cur_id}
+        for w in ws[-limit:]
+    ]

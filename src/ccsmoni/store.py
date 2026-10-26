@@ -307,6 +307,36 @@ class Store:
             rows = self._conn.execute(sql, params).fetchall()
             return {r["account_id"]: self._reading_from_row(r) for r in rows}
 
+    def status_since(self, account_id: str) -> int | None:
+        """ok 以外の状態が続いているときの開始時刻（epoch 秒）。直近の ok の後の、最初の ok 以外の snapshot の時刻。
+
+        一度も ok がなければ最初の snapshot。最新が ok（または snapshot が無い）なら None。
+        順序は _latest と同じ (taken_at, id)。
+        """
+        with self._lock:
+            last = self._conn.execute(
+                "SELECT taken_at, id, status FROM snapshots WHERE account_id = ? ORDER BY taken_at DESC, id DESC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if last is None or last["status"] == "ok":
+                return None
+            ok = self._conn.execute(
+                "SELECT taken_at, id FROM snapshots WHERE account_id = ? AND status = 'ok' "
+                "ORDER BY taken_at DESC, id DESC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if ok is None:
+                row = self._conn.execute(
+                    "SELECT taken_at FROM snapshots WHERE account_id = ? ORDER BY taken_at, id LIMIT 1", (account_id,)
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT taken_at FROM snapshots WHERE account_id = ? AND status != 'ok' "
+                    "AND (taken_at > ? OR (taken_at = ? AND id > ?)) ORDER BY taken_at, id LIMIT 1",
+                    (account_id, ok["taken_at"], ok["taken_at"], ok["id"]),
+                ).fetchone()
+        return int(row["taken_at"]) if row else None
+
     # ------------------------------------------------------------ 推移
 
     def history(

@@ -168,13 +168,14 @@ def test_state_shape(env):
     assert d["now"] == int(NOW.timestamp())
     assert d["collector"]["busy"] == []
     assert d["collector"]["last_run_at"] == int((NOW - timedelta(minutes=0)).timestamp())
-    assert d["ui"] == {"warn_percent": 70, "danger_percent": 90}
+    assert d["ui"] == {"warn_percent": 70, "danger_percent": 90, "tiles_per_page": 6}
+    assert d["palette"] == PALETTE
     assert d["config_error"] is None
     assert d["candidates"] == [{"suggested_id": "z", "config_dir": "~/x/z"}]
     a, b, c = d["accounts"]
     assert [x["id"] for x in d["accounts"]] == ["a", "b", "c"]
 
-    assert a["status"] == "ok" and a["plan"] == "max" and a["color"] == "#112233"
+    assert a["status"] == "ok" and a["plan"] == "max" and a["color"] == "#112233" and a["color_slot"] is None
     assert a["interval_minutes"] == 10 and a["stale"] is False and a["last_ok"] is None
     assert [lim["kind"] for lim in a["limits"]] == ["session", "weekly_all"]
     sess = a["limits"][0]
@@ -196,12 +197,52 @@ def test_state_shape(env):
 
     assert c["status"] == "ok" and c["enabled"] is False and c["next_run_at"] is None
     assert c["stale"] is False  # 無効なアカウントは古くても stale にしない
-    assert c["color"] == PALETTE[2] and c["login"] is None
-    assert b["color"] == PALETTE[1]  # 未設定の色は並び順でパレットから
+    assert (c["color_slot"], c["color"]) == (2, None) and c["login"] is None
+    assert (b["color_slot"], b["color"]) == (1, None)  # 未設定の色は並び順の番号（独自の色でなければ color は null）
 
     # 設定にないが履歴はあるアカウント。色は設定のアカウントが使っていない色から
-    assert d["archived"] == [{"id": "old", "label": "old", "color": PALETTE[0]}]
+    assert d["archived"] == [{"id": "old", "label": "old", "color_slot": 0, "color": None}]
     assert d["config_hash"] == svc.config_service.file_hash()
+
+
+def test_state_status_since_and_weekly_peaks(env):
+    client, svc, *_ = env
+    store = svc.store
+    # b: ok → ログイン切れが2回続く。開始は「最初の ok 以外」
+    save(store, reading("b", NOW - timedelta(hours=3)))
+    save(store, reading("b", NOW - timedelta(hours=2), status=Status.LOGGED_OUT))
+    save(store, reading("b", NOW - timedelta(hours=1), status=Status.LOGGED_OUT))
+    # a: 一度 ng → 復旧して ok。いまは ok なので null
+    save(store, reading("a", NOW - timedelta(hours=2), status=Status.LOGGED_OUT))
+    save(store, reading("a", NOW - timedelta(hours=1)))
+    a, b, c = client.get("/api/state").json()["accounts"]
+    assert a["status_since"] is None and b["status_since"] == int((NOW - timedelta(hours=2)).timestamp())
+    assert c["status"] == "never" and c["status_since"] is None
+    # 一度も ok がなければ最初の取得から
+    save(store, reading("c", NOW - timedelta(hours=5), status=Status.ERROR))
+    save(store, reading("c", NOW - timedelta(hours=4), status=Status.TIMEOUT))
+    c = client.get("/api/state").json()["accounts"][2]
+    assert c["status_since"] == int((NOW - timedelta(hours=5)).timestamp())
+
+
+def test_state_weekly_peaks(env):
+    client, svc, *_ = env
+    for w in range(8):  # 8週ぶん。最後の1つがいまの枠
+        at = NOW - timedelta(weeks=7 - w)
+        save(svc.store, Reading("a", at, "cli-usage", Status.OK,
+                                (Limit("weekly_all", "Current week (all models)", 10.0 + w, at + timedelta(days=3)),),
+                                extras={"plan": "max"}))
+    save(svc.store, reading("b", NOW - timedelta(hours=2)))
+    save(svc.store, reading("b", NOW - timedelta(hours=1), status=Status.LOGGED_OUT))
+    a, b, c = client.get("/api/state").json()["accounts"]
+    peaks = a["weekly_peaks"]
+    assert [p["peak_percent"] for p in peaks] == [12, 13, 14, 15, 16, 17]  # 直近6枠、古い順
+    assert [p["current"] for p in peaks] == [False] * 5 + [True]
+    assert peaks[-1]["resets_at"] == int((NOW + timedelta(days=3)).timestamp())
+    assert set(peaks[0]) == {"resets_at", "peak_percent", "current"}
+    # ok でない b は今の limits が無いので current なし。履歴が無い c は空
+    assert len(b["weekly_peaks"]) == 1 and b["weekly_peaks"][0]["current"] is False
+    assert c["weekly_peaks"] == []
 
 
 # ---------------------------------------------------------------- history / windows
@@ -235,6 +276,34 @@ def test_history_and_windows(env):
 
 
 # ---------------------------------------------------------------- refresh / Origin
+
+
+def test_history_since_until(env):
+    client, svc, *_ = env
+    t0 = NOW - timedelta(days=10)
+    for i in range(3):  # 10日前に3点
+        save(svc.store, reading("a", t0 + timedelta(minutes=10 * i), weekly=10 + i))
+    save(svc.store, reading("a", NOW - timedelta(hours=1)))  # 範囲の外
+    save(svc.store, reading("b", t0 + timedelta(minutes=5), status=Status.LOGGED_OUT))
+    since, until = int((t0 - timedelta(hours=1)).timestamp()), int((t0 + timedelta(hours=1)).timestamp())
+    d = client.get(f"/api/history?since={since}&until={until}&range=24h").json()  # range より優先
+    assert (d["since"], d["until"]) == (since, until)
+    weekly = next(s for s in d["series"] if s["account_id"] == "a" and s["kind"] == "weekly_all")
+    assert [p[1] for seg in weekly["segments"] for p in seg["points"]] == [10, 11, 12]
+    assert d["errors"] == [{"account_id": "b", "t": int((t0 + timedelta(minutes=5)).timestamp()), "status": "logged_out"}]
+    # 範囲内の取得の抜けも、指定した範囲で数える
+    save(svc.store, reading("a", t0 + timedelta(hours=3)))
+    until2 = int((t0 + timedelta(hours=4)).timestamp())
+    d = client.get(f"/api/history?since={since}&until={until2}").json()
+    assert d["gaps"] == [{"account_id": "a", "from": int((t0 + timedelta(minutes=20)).timestamp()),
+                          "to": int((t0 + timedelta(hours=3)).timestamp())}]
+    # ちょうど120日は通り、超えれば422。since >= until・片方だけ・範囲外の値も422
+    end = int(NOW.timestamp())
+    assert client.get(f"/api/history?since={end - 120 * 86400}&until={end}").status_code == 200
+    for q in (f"since={end - 120 * 86400 - 1}&until={end}", f"since={end}&until={end}", f"since={end + 1}&until={end}",
+              f"since={end - 100}", f"until={end}", "since=-5&until=10", "since=0&until=99999999999", "since=a&until=b"):
+        r = client.get(f"/api/history?{q}")
+        assert r.status_code == 422 and "error" in r.json(), q
 
 
 def test_refresh(env):
@@ -305,7 +374,12 @@ def test_config_get_put(env):
     assert d["error"] is None and d["candidates"][0]["suggested_id"] == "z"
     assert d["path"].endswith("config.toml")
     assert d["palette"] == PALETTE
-    assert d["colors"] == {"a": "#112233", "b": PALETTE[1], "c": PALETTE[2]}
+    assert "colors" not in d
+    assert d["slots"] == {
+        "a": {"color_slot": None, "color": "#112233"},
+        "b": {"color_slot": 1, "color": None},
+        "c": {"color_slot": 2, "color": None},
+    }
     assert d["history_ids"] == ["a", "old"]
     assert d["readonly"] == {"claude_path": "claude", "host": "127.0.0.1", "port": 8484}
 
@@ -329,12 +403,16 @@ def test_config_get_put(env):
     cfg["accounts"][0]["color"] = "red"
     r = client.put("/api/config", json={"config": cfg, "hash": new_hash})
     assert r.status_code == 422
-    assert r.json()["fields"] == [["accounts.0.color", "色は #rrggbb の形式で指定してください"]]
+    assert r.json()["fields"] == [["accounts.0.color", "色は 0〜6 の番号か #rrggbb の形式で指定してください"]]
     r = client.put("/api/config", json={"hash": new_hash})
     assert r.status_code == 422 and r.json()["error"] == "入力内容に誤りがあります"
 
     # claude_path・host・port は Web から変えられない（ファイルでだけ編集する）
     cfg["accounts"][0]["color"] = "#112233"
+    cfg["ui"]["tiles_per_page"] = 5
+    r = client.put("/api/config", json={"config": cfg, "hash": new_hash})
+    assert r.status_code == 422 and r.json()["fields"][0][0] == "ui.tiles_per_page"
+    cfg["ui"]["tiles_per_page"] = 6
     for sec, key, value in (("collector", "claude_path", "C:/evil/claude.exe"), ("collector", "claude_path", "calc.exe"),
                             ("server", "host", "0.0.0.0"), ("server", "port", 9999)):
         bad = {**cfg, sec: {**cfg[sec], key: value}}

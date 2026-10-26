@@ -40,6 +40,7 @@ from ccsmoni import insights
 from ccsmoni.config import (
     MSG_READONLY,
     PALETTE,
+    ColorSpec,
     AppConfig,
     ConfigConflictError,
     ConfigService,
@@ -56,6 +57,9 @@ log = logging.getLogger("ccsmoni.web")
 STATIC_DIR = Path(__file__).parent / "static"
 CONFIG_POLL_SECONDS = 3.0
 CANDIDATES_REFRESH_SECONDS = 300.0  # 未登録アカウントの走査はやや重いので、たまにだけやり直す
+MAX_HISTORY_SPAN = 120 * 86400  # /api/history の since〜until の上限
+MAX_EPOCH = 4102444800  # 2100-01-01。datetime に直せない巨大な値を弾く
+WEEKLY_PEAKS = 6  # accounts[].weekly_peaks の枠数
 RANGES = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 STALE_FACTOR = 3
 # Host ヘッダーとして常に受け付けるホスト（ポートは問わない）。ほかに *.ts.net と server.allowed_hosts
@@ -135,7 +139,7 @@ def _api_limits(reading: Reading, now: float, rows: list[dict]) -> list[dict]:
     return out
 
 
-def build_account_state(rt: Runtime, a: Any, color: str, latest: dict[str, Reading], now: float) -> dict:
+def build_account_state(rt: Runtime, a: Any, color: ColorSpec, latest: dict[str, Reading], now: float) -> dict:
     store, cfg = rt.services.store, rt.cfg
     interval = cfg.interval_for(a.id)
     reading = latest.get(a.id)
@@ -146,7 +150,8 @@ def build_account_state(rt: Runtime, a: Any, color: str, latest: dict[str, Readi
     st: dict[str, Any] = {
         "id": a.id,
         "label": a.label,
-        "color": color,
+        "color_slot": color[0],  # パレットの番号。独自の色のときは null
+        "color": color[1],  # 独自の色（#rrggbb）のときだけ。それ以外は null
         "enabled": a.enabled,
         "launch_command": a.launch_command,
         "interval_minutes": interval,
@@ -154,10 +159,12 @@ def build_account_state(rt: Runtime, a: Any, color: str, latest: dict[str, Readi
         "status": "never",
         "message": None,
         "taken_at": None,
+        "status_since": None,
         "stale": False,
         "plan": meta.get("last_plan"),
         "limits": [],
         "last_ok": None,
+        "weekly_peaks": [],
         "login": rt.services.login.state(a.id),
         "hints": [],
     }
@@ -174,9 +181,12 @@ def build_account_state(rt: Runtime, a: Any, color: str, latest: dict[str, Readi
             st["limits"] = _api_limits(reading, now, rows)
             st["hints"] = insights.hints(st, now)
         else:
+            st["status_since"] = store.status_since(a.id)
             ok = store.latest_ok(a.id)
             if ok is not None:
                 st["last_ok"] = {"taken_at": int(ok.taken_at.timestamp()), "limits": _api_limits(ok, now, rows)}
+    cur_weekly = next((lim["resets_at"] for lim in st["limits"] if lim["kind"] == "weekly_all"), None)
+    st["weekly_peaks"] = insights.weekly_peaks(store.windows(account_id=a.id, kind="weekly_all"), cur_weekly, WEEKLY_PEAKS)
     return st
 
 
@@ -199,13 +209,20 @@ def build_state(rt: Runtime, now: float, config_hash: str | None = None) -> dict
             "last_run_at": int(last_run) if last_run is not None else None,
             "next_run_at": int(next_run) if next_run is not None else None,
         },
-        "ui": {"warn_percent": rt.cfg.ui.warn_percent, "danger_percent": rt.cfg.ui.danger_percent},
+        "ui": {
+            "warn_percent": rt.cfg.ui.warn_percent,
+            "danger_percent": rt.cfg.ui.danger_percent,
+            "tiles_per_page": rt.cfg.ui.tiles_per_page,
+        },
+        "palette": PALETTE,
         "config_error": rt.services.config_service.last_error,
         # いまの設定ファイルのハッシュ（壊れていても計算する）。設定画面が外部の変更に気づくのに使う
         "config_hash": config_hash if config_hash is not None else rt.services.config_service.file_hash(),
         "accounts": accounts,
         # 履歴はあるが設定にないアカウント（削除したもの）。推移グラフの凡例・色に使う
-        "archived": [{"id": aid, "label": aid, "color": colors[aid]} for aid in archived_ids],
+        "archived": [
+            {"id": aid, "label": aid, "color_slot": colors[aid][0], "color": colors[aid][1]} for aid in archived_ids
+        ],
         "candidates": rt.candidates,
     }
 
@@ -339,11 +356,29 @@ def create_app(
         return build_state(rt, services.clock(), h)
 
     @app.get("/api/history")
-    async def get_history(range: str = "7d", kinds: str | None = None, accounts: str | None = None):
-        if range not in RANGES:
-            return _err(422, "range は 24h / 7d / 30d のいずれかで指定してください")
-        now = int(services.clock())
-        since = now - RANGES[range]
+    async def get_history(
+        range: str = "7d",
+        kinds: str | None = None,
+        accounts: str | None = None,
+        since: int | None = None,
+        until: int | None = None,
+    ):
+        # since / until（epoch 秒）を両方指定したら range より優先する。片方だけは曖昧なので 422
+        if since is not None or until is not None:
+            if since is None or until is None:
+                return _err(422, "since と until は両方指定してください")
+            if not 0 <= since <= MAX_EPOCH or not 0 <= until <= MAX_EPOCH:
+                return _err(422, "since / until は 2100 年までの epoch 秒で指定してください")
+            if since >= until:
+                return _err(422, "since は until より前にしてください")
+            if until - since > MAX_HISTORY_SPAN:
+                return _err(422, "範囲は最大 120 日です")
+        else:
+            if range not in RANGES:
+                return _err(422, "range は 24h / 7d / 30d のいずれかで指定してください")
+            until = int(services.clock())
+            since = until - RANGES[range]
+        now = until
         account_ids, kind_list = _csv(accounts), _csv(kinds)
 
         def work() -> dict:
@@ -400,8 +435,9 @@ def create_app(
             "path": short_path(cs.path),
             "error": cs.last_error,
             "candidates": rt.candidates,
-            "palette": list(PALETTE),
-            "colors": resolve_colors(rt.cfg.accounts),
+            "palette": PALETTE,
+            # 設定のアカウントの解決済みの色（色が未設定のものも含む）。設定画面の色見本に使う
+            "slots": {k: {"color_slot": v[0], "color": v[1]} for k, v in resolve_colors(rt.cfg.accounts).items()},
             "history_ids": history_ids,
             "readonly": readonly_values(rt.cfg),
         }

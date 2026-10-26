@@ -119,9 +119,21 @@ class ServerConfig(_Base):
         return out
 
 
+# 1ページに出すタイル数の選択肢（ダッシュボードのタイル表示。docs/UI-V2.md）
+TILES_PER_PAGE_CHOICES = (4, 6, 8, 9, 12)
+
+
 class UiConfig(_Base):
     warn_percent: int = Field(70, ge=0, le=100)
     danger_percent: int = Field(90, ge=0, le=100)
+    tiles_per_page: int = 6
+
+    @field_validator("tiles_per_page")
+    @classmethod
+    def _check_tiles_per_page(cls, v: int) -> int:
+        if v not in TILES_PER_PAGE_CHOICES:
+            raise ValueError("1ページのタイル数は " + " / ".join(map(str, TILES_PER_PAGE_CHOICES)) + " のいずれかで指定してください")
+        return v
 
     @model_validator(mode="after")
     def _warn_below_danger(self) -> UiConfig:
@@ -135,7 +147,8 @@ class AccountConfig(_Base):
     label: str = Field(min_length=1)
     config_dir: str = Field(min_length=1)  # 書いたまま保存する（~ や環境変数を含んでよい）
     launch_command: str | None = None
-    color: str | None = None
+    # 省略 = 自動 / 整数 0〜6 = パレットの番号 / "#rrggbb" = 独自の色（resolve_colors を参照）
+    color: int | str | None = None
     interval_minutes: int | None = Field(None, ge=1, le=1440)  # None = 全体の既定値
     enabled: bool = True
 
@@ -146,12 +159,22 @@ class AccountConfig(_Base):
             raise ValueError("英数字・ハイフン・アンダースコアのみ、1〜40文字で指定してください")
         return v
 
-    @field_validator("color")
+    @field_validator("color", mode="before")
     @classmethod
-    def _check_color(cls, v: str | None) -> str | None:
-        if v is not None and not _COLOR_RE.match(v):
-            raise ValueError("色は #rrggbb の形式で指定してください")
-        return v
+    def _check_color(cls, v: Any) -> int | str | None:
+        # before: bool（True が 1 に化ける）や小数を、型の変換に任せず自分で弾く
+        if v is None:
+            return None
+        msg = f"色は 0〜{len(PALETTE['light']) - 1} の番号か #rrggbb の形式で指定してください"
+        if isinstance(v, bool):
+            raise ValueError(msg)
+        if isinstance(v, int):
+            if not 0 <= v < len(PALETTE["light"]):
+                raise ValueError(msg)
+            return v
+        if isinstance(v, str) and _COLOR_RE.match(v):
+            return v
+        raise ValueError(msg)
 
     def expanded_dir(self) -> Path:
         """~ と環境変数を展開した実パス。"""
@@ -288,24 +311,47 @@ def short_path(p: Path) -> str:
 # 色
 # ---------------------------------------------------------------------------
 
-# アカウントの色の既定のパレット。UI にも /api/config の palette で同じものを渡す
-PALETTE = ["#4f8cff", "#f5a524", "#17c964", "#f31260", "#9353d3", "#06b7db", "#f56d3b", "#7c8aa5"]
+# アカウントの色のパレット（検証済みの7色。赤は状態の色と紛れるので使わない。docs/UI-V2.md「色」）。
+# サーバーは色の番号（slot）を返し、UI がテーマ（light / dark）に応じた色を選ぶ。/api/state と /api/config の palette で渡す
+PALETTE: dict[str, list[str]] = {
+    "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],
+    "dark": ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"],
+}
+SLOT_COUNT = len(PALETTE["light"])
+
+# 色の解決結果: (color_slot, color)。パレットの色なら (番号, None)、独自の色なら (None, "#rrggbb")
+ColorSpec = tuple[int | None, str | None]
 
 
-def resolve_colors(accounts: Sequence[AccountConfig], archived_ids: Sequence[str] = ()) -> dict[str, str]:
-    """アカウント id → 表示に使う色。/api/state・/api/config・UI で同じ色にするため、色はここだけで決める。
+def resolve_colors(accounts: Sequence[AccountConfig], archived_ids: Sequence[str] = ()) -> dict[str, ColorSpec]:
+    """アカウント id → (color_slot, color)。/api/state・/api/config・UI で同じ色にするため、色はここだけで決める。
 
-    - 設定のアカウント: 指定があればその色、なければ設定の並び順でパレットから（index % パレットの数）。
-    - アーカイブ（履歴はあるが設定にない）: id の昇順に、設定のアカウントが使っていないパレットの色から順に割り当てる
-      （全部使われていればパレット全体から）。同じ設定・同じ履歴なら、いつも同じ色になる。
+    - 設定のアカウント:
+        整数 → その番号 (n, None) / "#rrggbb" → (None, hex) / 省略 → 自動で番号を割り当てる。
+      自動は、並び順（設定の位置 i）に対して i % 7 番を第一候補にし、ほかのアカウントが明示した番号や
+      先に自動で割り当てた番号と重なるときは、次の空き番号（巡回）にする。全部埋まっていれば第一候補のまま（重複を許す）。
+      明示の番号を先に確保してから自動を決めるので、設定の並び順に関係なく明示の番号が優先される。
+    - アーカイブ（履歴はあるが設定にない）: id の昇順に、設定のアカウントが使っていない番号から順に割り当てる
+      （全部使われていれば全体から）。同じ設定・同じ履歴なら、いつも同じ色になる。
     """
-    out: dict[str, str] = {}
+    out: dict[str, ColorSpec] = {}
+    taken = {a.color for a in accounts if isinstance(a.color, int)}
     for i, a in enumerate(accounts):
-        out[a.id] = a.color or PALETTE[i % len(PALETTE)]
-    used = {c.lower() for c in out.values()}
-    free = [c for c in PALETTE if c.lower() not in used] or PALETTE
+        if isinstance(a.color, int):
+            out[a.id] = (a.color, None)
+        elif isinstance(a.color, str):
+            out[a.id] = (None, a.color)
+        else:
+            slot = next(
+                (c for c in ((i + k) % SLOT_COUNT for k in range(SLOT_COUNT)) if c not in taken),
+                i % SLOT_COUNT,
+            )
+            taken.add(slot)
+            out[a.id] = (slot, None)
+    used = {slot for slot, _ in out.values() if slot is not None}
+    free = [n for n in range(SLOT_COUNT) if n not in used] or list(range(SLOT_COUNT))
     for j, aid in enumerate(sorted(x for x in set(archived_ids) if x not in out)):
-        out[aid] = free[j % len(free)]
+        out[aid] = (free[j % len(free)], None)
     return out
 
 
@@ -496,7 +542,7 @@ class ConfigService:
                     id=c["suggested_id"],
                     label=c["suggested_id"],
                     config_dir=c["config_dir"],
-                    color=PALETTE[i % len(PALETTE)],
+                    color=i % SLOT_COUNT,
                 )
             )
         _atomic_write(self.path, _render_initial(cfg).encode("utf-8"))
@@ -716,7 +762,11 @@ def _render_initial(cfg: AppConfig) -> str:
         "画面を配信する場所。host は 127.0.0.1 / ::1 / localhost のみ。host・port はこのファイルでだけ変更できる",
         {"allowed_hosts": "受け付ける追加のホスト名（MagicDNS の短い名前など。*.ts.net は常に受け付ける）"},
     )
-    section("ui", "使用率の色分け（%）。warn < danger", {})
+    section(
+        "ui",
+        "使用率の色分け（%）。warn < danger",
+        {"tiles_per_page": "1ページに並べるタイルの数（4 / 6 / 8 / 9 / 12）。アカウントがこれを超えるとページを分ける"},
+    )
 
     accounts = tomlkit.aot()
     for a in d["accounts"]:
@@ -727,5 +777,6 @@ def _render_initial(cfg: AppConfig) -> str:
         accounts.append(t)
     if len(accounts):
         doc.add(tomlkit.comment("監視するアカウント。id は履歴のキーなので変更しない"))
+        doc.add(tomlkit.comment('color: 省略 = 自動 / 0〜6 = パレットの番号 / "#rrggbb" = 独自の色'))
         doc.add("accounts", accounts)
     return tomlkit.dumps(doc)
