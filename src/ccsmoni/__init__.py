@@ -1,1 +1,1 @@
-"""ccsmoni — Claude Code s monitor"""
+"""ccsmoni — Claude Code の利用状況モニター（非公式。Anthropic とは無関係）"""

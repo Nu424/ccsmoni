@@ -34,9 +34,11 @@ def load_words() -> list[str]:
 
 
 def git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=True
-    ).stdout
+    return git_bytes(*args).decode("utf-8", errors="replace")
+
+
+def git_bytes(*args: str) -> bytes:
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, check=True).stdout
 
 
 def target_files(check_all: bool) -> list[str]:
@@ -49,10 +51,12 @@ def target_files(check_all: bool) -> list[str]:
 
 def read_content(path: str, check_all: bool) -> str:
     # ステージ版（:path）を読む。作業ツリーとステージがずれていても、実際にコミットされる中身を調べる
+    # 画像などのバイナリ（NUL を含むもの）は対象外にする。テキストは壊れた文字を置き換えて読む
     try:
-        if check_all:
-            return (ROOT / path).read_text(encoding="utf-8", errors="replace")
-        return git("show", f":{path}")
+        data = (ROOT / path).read_bytes() if check_all else git_bytes("show", f":{path}")
+        if b"\x00" in data[:8192]:
+            return ""
+        return data.decode("utf-8", errors="replace")
     except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
         return ""
 

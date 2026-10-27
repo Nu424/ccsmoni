@@ -1,8 +1,10 @@
 [project]
 name = "ccsmoni"
 version = "0.1.0"
-description = "Claude Code s monitor — 複数アカウントの利用状況を記録・可視化する"
+description = "複数の Claude Code アカウントの利用状況（5時間枠・週間枠）を記録し、推移を可視化する非公式のモニター"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",

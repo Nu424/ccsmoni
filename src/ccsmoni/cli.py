@@ -7,7 +7,7 @@ import sys
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="ccsmoni", description="Claude Code s monitor — 利用状況の記録と可視化")
+    p = argparse.ArgumentParser(prog="ccsmoni", description="Claude Code の利用状況モニター（非公式）")
     sub = p.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve", help="常駐して定期取得し、ダッシュボードを配信する")
     serve.add_argument("--port", type=int, help="待ち受けるポート（省略時は設定の server.port）")

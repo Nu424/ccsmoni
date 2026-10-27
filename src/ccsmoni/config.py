@@ -119,7 +119,7 @@ class ServerConfig(_Base):
         return out
 
 
-# 1ページに出すタイル数の選択肢（ダッシュボードのタイル表示。docs/UI-V2.md）
+# 1ページに出すタイル数の選択肢（ダッシュボードのタイル表示。docs/design/UI-V2.md）
 TILES_PER_PAGE_CHOICES = (4, 6, 8, 9, 12)
 
 
@@ -311,7 +311,7 @@ def short_path(p: Path) -> str:
 # 色
 # ---------------------------------------------------------------------------
 
-# アカウントの色のパレット（検証済みの7色。赤は状態の色と紛れるので使わない。docs/UI-V2.md「色」）。
+# アカウントの色のパレット（検証済みの7色。赤は状態の色と紛れるので使わない。docs/design/UI-V2.md「色」）。
 # サーバーは色の番号（slot）を返し、UI がテーマ（light / dark）に応じた色を選ぶ。/api/state と /api/config の palette で渡す
 PALETTE: dict[str, list[str]] = {
     "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],

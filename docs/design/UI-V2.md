@@ -1,7 +1,7 @@
 # UI v2 設計（タイル基本＋時間軸ナビゲーション）
 
 > 2026-10-27 のフィードバックを受けて、ダッシュボードを作り直すための仕様。v1（`static/` の現行の UI）との後方互換は考えない。
-> 元になったプロトタイプ: `prototypes/b-tiles.*`（基本）、`prototypes/a-matrix.*`（5h レーン）。課題の整理は `prototypes/BRIEF.md`。
+> 元になったプロトタイプ: B 案（タイル。基本）と A 案（5h レーン）。プロトタイプは公開前に削除し、コミット `319346a` に残っている。課題の整理は [DASHBOARD-REDESIGN.md](DASHBOARD-REDESIGN.md)。
 
 ## 方針
 
