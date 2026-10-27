@@ -1,5 +1,7 @@
 # ccsmoni（ししすもに）
 
+*An unofficial, Windows-only dashboard that records and visualizes usage (5-hour and weekly limits) across multiple Claude Code accounts. Documentation is in Japanese.*
+
 複数の Claude Code アカウントの**利用状況（5時間枠・週間枠）を定期的に記録し、推移をダッシュボードで見られるようにする**、Windows 向けの個人用ツールです。
 
 ![ダッシュボード（架空のデモデータ）](docs/images/dashboard.png)
