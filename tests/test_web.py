@@ -176,6 +176,7 @@ def test_state_shape(env):
     assert [x["id"] for x in d["accounts"]] == ["a", "b", "c"]
 
     assert a["status"] == "ok" and a["plan"] == "max" and a["color"] == "#112233" and a["color_slot"] is None
+    assert a["provider"] == "claude"
     assert a["interval_minutes"] == 10 and a["stale"] is False and a["last_ok"] is None
     assert [lim["kind"] for lim in a["limits"]] == ["session", "weekly_all"]
     sess = a["limits"][0]
@@ -413,7 +414,7 @@ def test_config_get_put(env):
         "c": {"color_slot": 2, "color": None},
     }
     assert d["history_ids"] == ["a", "old"]
-    assert d["readonly"] == {"claude_path": "claude", "host": "127.0.0.1", "port": 8484}
+    assert d["readonly"] == {"claude_path": "claude", "codex_path": "codex", "host": "127.0.0.1", "port": 8484}
 
     cfg = d["config"]
     cfg["accounts"][0]["label"] = "Aさん"
@@ -474,6 +475,16 @@ def test_account_test_does_not_save(env):
     assert d["limits"][0]["pace"] is not None
     assert svc.store.latest() == {}  # 保存しない
     assert client.post("/api/accounts/test", json={}).status_code == 422
+
+
+def test_account_test_passes_provider(env):
+    client, svc, *_ = env
+    source = svc.probe_factory(svc.config_service.current).source
+    assert client.post("/api/accounts/test", json={"config_dir": "~/x/cx", "provider": "codex"}).status_code == 200
+    assert client.post("/api/accounts/test", json={"config_dir": "~/x/cl"}).status_code == 200
+    assert [str(a.provider) for a in source.accounts] == ["codex", "claude"]
+    r = client.post("/api/accounts/test", json={"config_dir": "~/x/cx", "provider": "gemini"})
+    assert r.status_code == 422 and r.json()["fields"][0][0] == "provider"
 
 
 def test_account_test_runs_one_at_a_time(env):

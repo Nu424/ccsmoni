@@ -1,13 +1,14 @@
 """ログインの起動と完了の監視（LoginService）。
 
-何を: カードの［ログイン］から、PC 上に `CLAUDE_CONFIG_DIR` を設定した `claude auth login` のコンソールを開き、
-      `claude auth status --json` を数秒おきに確認して、完了（done / mismatch）・失敗・タイムアウトを判定する。
+何を: カードの［ログイン］から、PC 上に `CLAUDE_CONFIG_DIR` を設定した `claude auth login`
+      （Codex なら `CODEX_HOME` を設定した `codex login`）のコンソールを開き、ログイン状態を数秒おきに確認して、
+      完了（done / mismatch）・失敗・タイムアウトを判定する。
 なぜ: ログイン切れをその画面から直せるようにする（PLAN §5.2、U3）。
 方針:
-  - ログインは Anthropic 自身の手順で完了させる。ccsmoni はコードやトークンに一切触れない
+  - ログインは Anthropic（Codex なら OpenAI）自身の手順で完了させる。ccsmoni はコードやトークンに一切触れない
     （新しいコンソールの stdin/stdout はそのコンソールにつながり、ccsmoni は読まない）。
-  - シェルは介さず引数配列で起動する。起動できるのは設定の claude 本体だけ。
-  - 監視は asyncio のタスク。auth status の実行（0.3 秒程度のブロッキング）は to_thread。
+  - シェルは介さず引数配列で起動する。起動できるのは設定の claude / codex 本体だけ。
+  - 監視は asyncio のタスク。ログイン状態の確認（claude は 0.3 秒、codex は 1〜3 秒程度のブロッキング）は to_thread。
   - 同じアカウントで二重に起動しない（監視中なら今の状態を返すだけ）。
   - 完了したら store の account_meta.last_org_id と orgId を比べ、違えば mismatch。どちらでも再取得を依頼する
     （取得中なら、その取得が終わったあとにもう一度。ログイン前の状態で取った結果のままにしないため）。
@@ -26,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ccsmoni.model import Account
+from ccsmoni.model import CONFIG_DIR_ENV, Account, Provider
 
 log = logging.getLogger("ccsmoni.login")
 
@@ -38,7 +39,9 @@ MSG_WAITING = "PC 側にログイン画面を開きました"
 MSG_DONE = "ログインしました"
 MSG_MISMATCH = "前回と別のアカウントでログインした可能性があります（組織が前回と違います）"
 MSG_FAILED_EXIT = "ログインが完了しないまま、ログイン画面が閉じられました"
-MSG_FAILED_START = "ログイン画面を開けませんでした（claude を起動できません）"
+MSG_FAILED_START = "ログイン画面を開けませんでした（{cli} を起動できません）"
+# provider ごとの、ログインのサブコマンド
+LOGIN_ARGS = {Provider.CLAUDE: ("auth", "login"), Provider.CODEX: ("login",)}
 MSG_TIMEOUT = "10 分以内にログインが完了しませんでした"
 
 
@@ -64,7 +67,7 @@ class LoginState:
 class LoginService:
     def __init__(
         self,
-        command: Callable[[], list[str]],
+        command: Callable[[Account], list[str]],
         auth_status: Callable[[Account], dict | None],
         last_org_id: Callable[[str], str | None],
         on_logged_in: Callable[[str], Any],
@@ -74,8 +77,10 @@ class LoginService:
         timeout_seconds: float = TIMEOUT_SECONDS,
     ) -> None:
         """
-        command: claude 本体の起動コマンド（例: ["C:\\...\\claude.exe"]）を返す関数。設定の変更に追従するため関数にする。
+        command: アカウントの provider に合う本体の起動コマンド（例: ["C:\\...\\claude.exe"]）を返す関数。
+            設定の変更に追従するため関数にする。
         auth_status: CliUsageSource.auth_status と同じ形（loggedIn / orgId を含む dict、読めなければ None）。
+            provider の違いは呼び出し側で振り分ける（RoutingSource.auth_status）。
         last_org_id: アカウント id → 前回ログインしていたときの orgId（store の account_meta）。
         on_logged_in: ログイン完了時に呼ぶ（Scheduler.refresh_soon。取得中でも、終わったあとに必ず取り直される）。
         """
@@ -108,13 +113,13 @@ class LoginService:
     # ------------------------------------------------------------ 起動
 
     def _spawn_console(self, account: Account) -> Any:
-        """新しいコンソールで `claude auth login` を開く。stdin/stdout は渡さない（＝新しいコンソールにつながる）。"""
+        """新しいコンソールで `claude auth login`（`codex login`）を開く。stdin/stdout は渡さない（＝新しいコンソールにつながる）。"""
         env = os.environ.copy()  # グローバルの os.environ は変更しない
-        env["CLAUDE_CONFIG_DIR"] = str(account.config_dir)
+        env[CONFIG_DIR_ENV[account.provider]] = str(account.config_dir)
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-        return self.popen([*self.command(), "auth", "login"], env=env, shell=False, **kwargs)
+        return self.popen([*self.command(account), *LOGIN_ARGS[account.provider]], env=env, shell=False, **kwargs)
 
     def start(self, account: Account) -> dict[str, Any]:
         """ログイン画面を開き、監視を始める。すでに待っているなら何もしないで今の状態を返す。
@@ -128,7 +133,7 @@ class LoginService:
             proc = self._spawn_console(account)
         except Exception as e:
             log.error("%s: ログイン画面を開けませんでした（%s）", account.id, type(e).__name__)
-            s = LoginState(account.id, "failed", now, MSG_FAILED_START, finished_at=now)
+            s = LoginState(account.id, "failed", now, MSG_FAILED_START.format(cli=account.provider), finished_at=now)
             self._states[account.id] = s
             return s.to_api()
         s = LoginState(account.id, "waiting", now, MSG_WAITING, proc=proc)

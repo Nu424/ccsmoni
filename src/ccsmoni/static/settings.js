@@ -156,10 +156,14 @@ export function createSettings(ctx) {
     "collector.default_interval_minutes": "既定の取得間隔", "collector.timeout_seconds": "タイムアウト",
     "collector.concurrency": "同時実行数", "ui.warn_percent": "警告", "ui.danger_percent": "危険",
     "ui.tiles_per_page": "1ページのタイル数", "server.port": "ポート", "server.host": "ホスト", "collector.discover_roots": "探す場所",
-    "collector.claude_path": "claude の場所", "ui": "色のしきい値", "accounts": "アカウント",
+    "collector.claude_path": "claude の場所", "collector.codex_path": "codex の場所", "ui": "色のしきい値", "accounts": "アカウント",
   };
-  // 画面に入力欄があるもの（claude_path / host / port は読み取り専用なので、エラーは保存バーの一覧に出す）
-  const READONLY_FIELDS = new Set(["server.port", "server.host", "collector.claude_path"]);
+  // 画面に入力欄があるもの（claude_path / codex_path / host / port は読み取り専用なので、エラーは保存バーの一覧に出す）
+  const READONLY_FIELDS = new Set(["server.port", "server.host", "collector.claude_path", "collector.codex_path"]);
+  // provider ごとの表示名と、設定フォルダを渡す環境変数
+  const PROVIDERS = { claude: { name: "Claude Code", env: "CLAUDE_CONFIG_DIR", dir: "~/claude-configs/acct-a" },
+    codex: { name: "Codex", env: "CODEX_HOME", dir: "~/.codex" } };
+  const providerOf = (a) => (a.provider === "codex" ? "codex" : "claude");
   const fieldExists = (f) => f in GLOBAL_FIELDS && f !== "accounts" && !READONLY_FIELDS.has(f);
   const labelFor = (f) => GLOBAL_FIELDS[f] || f;
 
@@ -367,6 +371,7 @@ export function createSettings(ctx) {
       h("span.sw", { style: { background: color }, class: auto ? "is-auto" : "",
         title: auto ? "自動で決めた色" : null }),
       h("span.acct-title", [nameEl, h("span.acct-id.mono", a.id || "（id 未入力）")]),
+      providerOf(a) === "codex" ? h("span.chip", "Codex") : null,
       rowErr ? h("span.chip.tone-danger", "要修正") : null,
       isNew ? h("span.chip.tone-info", "新規") : null,
       h("span.grow"),
@@ -442,6 +447,18 @@ export function createSettings(ctx) {
           onInput: (v) => { const el = head()?.querySelector(".acct-id"); if (el) el.textContent = v || "（id 未入力）"; paintHistNote(v); } }), histNote],
         { errKey: ek("id"), help: "履歴を記録するときの名前です。英数字・ - ・ _ で。保存したあとは変えられません。" })
       : h("div.field", [h("span.field-label", "id"), h("code.readonly", a.id), h("span.field-help", "履歴のキーなので変えられません。")]);
+    // 種類（Claude Code / Codex）も id と同じく、保存したあとは変えない（同じ id の履歴に別の CLI の値が混ざらないように）
+    const prov = providerOf(a);
+    const providerField = isNew
+      ? field("種類", h("div.seg", { role: "group", "aria-label": "種類" }, Object.entries(PROVIDERS).map(([v, p]) =>
+          h("button", { type: "button", "aria-pressed": String(prov === v), onclick: () => {
+            a.provider = v === "claude" ? null : v;
+            st.tests.delete(k);
+            changed(ek("provider"));
+            render();
+          } }, p.name))),
+        { errKey: ek("provider"), div: true, help: "保存したあとは変えられません。" })
+      : h("div.field", [h("span.field-label", "種類"), h("code.readonly", PROVIDERS[prov].name), h("span.field-help", "保存したあとは変えられません。")]);
 
     return h("div.acct-editor", { onclick: (e) => e.stopPropagation() }, [
       h("div.form-grid", [
@@ -449,7 +466,8 @@ export function createSettings(ctx) {
           onInput: (v) => { const el = head()?.querySelector(".acct-name"); if (el) el.textContent = v || "（名前なし）"; } }),
           { errKey: ek("label") }),
         idField,
-        field("設定フォルダ（CLAUDE_CONFIG_DIR）", textInput(a, "config_dir", { errKey: ek("config_dir"), mono: true, placeholder: "~/claude-configs/acct-a" }),
+        providerField,
+        field(`設定フォルダ（${PROVIDERS[prov].env}）`, textInput(a, "config_dir", { errKey: ek("config_dir"), mono: true, placeholder: PROVIDERS[prov].dir }),
           { errKey: ek("config_dir"), wide: true, help: "~ や %USERPROFILE% も使えます。" }),
         field("起動コマンド", textInput(a, "launch_command", { nullable: true, errKey: ek("launch_command"), mono: true, placeholder: "例: claude-acct-a" }),
           { errKey: ek("launch_command"), help: "ログインの案内とコピー用です。ccsmoni が実行することはありません。" }),
@@ -534,7 +552,7 @@ export function createSettings(ctx) {
     st.tests.set(k, { loading: true });
     render();
     try {
-      const r = await api.testAccount(a.config_dir);
+      const r = await api.testAccount(a.config_dir, providerOf(a));
       st.tests.set(k, { result: r });
     } catch (e) {
       // 429: 別の接続テストがまだ実行中（サーバーは1つずつしか動かさない）
@@ -565,6 +583,7 @@ export function createSettings(ctx) {
     const a = {
       id: cand ? uniqueId(cand.suggested_id) : "",
       label: cand ? cand.suggested_id : "",
+      provider: cand && cand.provider === "codex" ? "codex" : null,
       config_dir: cand ? cand.config_dir : "",
       launch_command: null,
       color: free,
@@ -606,23 +625,23 @@ export function createSettings(ctx) {
     const cands = st.candidates.filter((c) => !known.has(c.config_dir));
     if (!cands.length) return null;
     return h("section.panel.cands", [
-      h("div.panel-head", [h("h2", "見つかったアカウント"), h("span.panel-sub", "まだ登録されていない Claude の設定フォルダです")]),
+      h("div.panel-head", [h("h2", "見つかったアカウント"), h("span.panel-sub", "まだ登録されていない Claude Code・Codex の設定フォルダです")]),
       h("ul.cand-list", cands.map((c) => h("li.cand", [
-        h("span.cand-text", [h("b.mono", c.suggested_id), h("span.mono.muted", c.config_dir)]),
+        h("span.cand-text", [h("b.mono", c.suggested_id), c.provider === "codex" ? h("span.chip", "Codex") : null, h("span.mono.muted", c.config_dir)]),
         h("button.btn.btn-sm", { type: "button", onclick: () => addAccount(c) }, "＋ 追加"),
       ]))),
     ]);
   }
 
   // ---- 読み取り専用の項目 -------------------------------------------------------------
-  // claude の場所・ホスト・ポートは、画面からは変えられない（ネットワークに出す設定や実行するファイルなので、
+  // claude・codex の場所、ホスト、ポートは、画面からは変えられない（ネットワークに出す設定や実行するファイルなので、
   // ファイルを直接編集したときだけ変わるようにする）。古いサーバーは readonly を返さないので、設定の値で代用する。
   function readonlyFields(c, sv) {
-    const ro = st.readonly || { claude_path: c.claude_path, host: sv && sv.host, port: sv && sv.port };
+    const ro = st.readonly || { claude_path: c.claude_path, codex_path: c.codex_path, host: sv && sv.host, port: sv && sv.port };
     const show = (v) => (v == null || v === "" ? "（自動）" : String(v));
     const item = (label, v) => h("div.field", [h("span.field-label", label), h("code.readonly.mono", show(v)),
       h("span.field-help", "設定ファイルで編集できます。")]);
-    return [item("claude の場所", ro.claude_path), item("ホスト", ro.host), item("ポート", ro.port)];
+    return [item("claude の場所", ro.claude_path), item("codex の場所", ro.codex_path), item("ホスト", ro.host), item("ポート", ro.port)];
   }
 
   // ---- 全体設定 ----------------------------------------------------------------------

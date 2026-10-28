@@ -266,6 +266,7 @@ canvas.base { transition: opacity .2s; }
 .tile.dup .t-head .sw { background: repeating-linear-gradient(135deg, var(--c) 0 2px, var(--surface) 2px 3.5px); box-shadow: inset 0 0 0 1px var(--c); }
 .t-head h3 { margin: 0; font-size: 13.5px; font-weight: 650; letter-spacing: -.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .plan { font-size: 10px; font-weight: 650; letter-spacing: .06em; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; line-height: 15px; flex: none; }
+.plan.prov { letter-spacing: .02em; color: var(--ink-2); background: var(--surface-3); border-color: transparent; }
 .t-state { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
 .t-state.crit { color: var(--st-crit-ink); font-weight: 600; }
 .t-state.crit svg { color: var(--st-crit); }

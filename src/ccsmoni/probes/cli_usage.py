@@ -88,7 +88,7 @@ class CliUsageSource:
 
     # ---- 起動まわり ----
 
-    def _base_command(self) -> list[str]:
+    def base_command(self) -> list[str]:
         """起動コマンドの先頭部分。単一の文字列は PATH から実体（claude.exe など）に解決する。"""
         if isinstance(self.claude_path, str):
             return [shutil.which(self.claude_path) or self.claude_path]
@@ -99,7 +99,7 @@ class CliUsageSource:
         timeout = self.timeout_seconds if timeout is None else timeout
         if timeout <= 0:
             return _Run(timed_out=True)  # 締め切りを過ぎている
-        cmd = self._base_command() + args
+        cmd = self.base_command() + args
         env = os.environ.copy()  # グローバルの os.environ は変更しない
         if config_dir is not None:
             env["CLAUDE_CONFIG_DIR"] = config_dir
@@ -137,7 +137,7 @@ class CliUsageSource:
             return _Run(error=f"{type(e).__name__}: {e}")
 
     def _cli_version(self, timeout: float | None = None) -> str | None:
-        key = tuple(self._base_command())
+        key = tuple(self.base_command())
         now = time.monotonic()
         hit = CliUsageSource._version_cache.get(key)
         if hit is not None and hit[1] > now:

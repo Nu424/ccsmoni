@@ -150,6 +150,7 @@ def build_account_state(rt: Runtime, a: Any, color: ColorSpec, latest: dict[str,
     st: dict[str, Any] = {
         "id": a.id,
         "label": a.label,
+        "provider": str(a.provider_kind),
         "color_slot": color[0],  # パレットの番号。独自の色のときは null
         "color": color[1],  # 独自の色（#rrggbb）のときだけ。それ以外は null
         "enabled": a.enabled,
@@ -499,13 +500,15 @@ def create_app(
         config_dir = body.get("config_dir") if isinstance(body, dict) else None
         if not isinstance(config_dir, str) or not config_dir.strip():
             return _err(422, "入力内容に誤りがあります", fields=[["config_dir", "空にはできません"]])
-        # claude を起動するので、同時に1件までにする（連打や複数の画面から、プロセスが積み上がらないように）
+        provider = body.get("provider") or "claude"
+        if provider not in ("claude", "codex"):
+            return _err(422, "入力内容に誤りがあります", fields=[["provider", "claude か codex を指定してください"]])
+        # claude / codex を起動するので、同時に1件までにする（連打や複数の画面から、プロセスが積み上がらないように）
         if rt.testing:
             return _err(429, "接続テストを実行中です")
         from ccsmoni.config import AccountConfig
 
-        expanded = AccountConfig(id="test", label="test", config_dir=config_dir).expanded_dir()
-        account = Account(id="test", label="test", config_dir=expanded)
+        account = AccountConfig(id="test", label="test", config_dir=config_dir, provider=provider).to_account()
         probe = services.probe_factory(rt.cfg)
         now = services.clock()
         rt.testing = True
@@ -531,8 +534,7 @@ def create_app(
         a = next((x for x in rt.cfg.accounts if x.id == account_id), None)
         if a is None:
             return _err(404, f"アカウント「{account_id}」が見つかりません")
-        account = Account(id=a.id, label=a.label, config_dir=a.expanded_dir(), launch_command=a.launch_command)
-        state = services.login.start(account)
+        state = services.login.start(a.to_account())
         return JSONResponse({"login": state}, status_code=202)
 
     # --- 静的 UI -------------------------------------------------------------
@@ -562,10 +564,9 @@ def build_services(demo: bool = False, config_service: ConfigService | None = No
     """
     from ccsmoni.config import app_home, config_path, db_path
     from ccsmoni.login import LoginService
-    from ccsmoni.parser_usage import UsageTextParser
     from ccsmoni.probes.base import Probe
-    from ccsmoni.probes.cli_usage import CliUsageSource
-    from ccsmoni.scheduler import Scheduler, default_probe_factory
+    from ccsmoni.probes.routing import RoutingParser
+    from ccsmoni.scheduler import Scheduler, default_probe_factory, default_sources
     from ccsmoni.store import Store
 
     home = app_home()
@@ -582,15 +583,17 @@ def build_services(demo: bool = False, config_service: ConfigService | None = No
         source = demo_mod.DemoSource(home)
 
         def probe_factory(c: AppConfig) -> Probe:
-            return Probe(name="cli-usage", source=source, parser=UsageTextParser())
+            return Probe(name="cli", source=source, parser=RoutingParser())
 
         scheduler = Scheduler(store, cfg, probe_factory)
         login = LoginService(
-            command=lambda: ["claude"],
+            command=lambda account: [str(account.provider)],
             auth_status=source.auth_status,
             last_org_id=lambda aid: (store.get_account_meta(aid) or {}).get("last_org_id"),
             on_logged_in=scheduler.refresh_soon,
-            popen=lambda args, env=None, **kw: demo_mod.DemoConsole(source, Path(env["CLAUDE_CONFIG_DIR"]).name),
+            popen=lambda args, env=None, **kw: demo_mod.DemoConsole(
+                source, Path(env["CLAUDE_CONFIG_DIR" if args[-2:] == ["auth", "login"] else "CODEX_HOME"]).name
+            ),
             poll_seconds=2.0,
         )
         return Services(cs, store, scheduler, login, probe_factory,
@@ -599,11 +602,10 @@ def build_services(demo: bool = False, config_service: ConfigService | None = No
     scheduler = Scheduler(store, cfg, default_probe_factory)
 
     def auth_status(account: Account) -> dict | None:
-        c = scheduler.config.collector
-        return CliUsageSource(c.claude_path, c.timeout_seconds).auth_status(account)
+        return default_sources(scheduler.config).auth_status(account)
 
-    def command() -> list[str]:
-        return CliUsageSource(scheduler.config.collector.claude_path)._base_command()
+    def command(account: Account) -> list[str]:
+        return default_sources(scheduler.config).source_for(account).base_command()
 
     login = LoginService(
         command=command,

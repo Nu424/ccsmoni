@@ -8,8 +8,8 @@
     置き換える直前にもう一度ハッシュを確かめる（読んでから書くまでの間に外部で変更された場合も上書きしない）。
   - 保存では、書き出す予定の TOML 全体を、読み込みと同じ検証に通してから置き換える（壊れたファイルを残さない）。
   - 変更検知は単純な poll()。スレッドや asyncio には依存しない（呼び出し側が定期的に呼ぶ）。
-  - 起動するコマンド（collector.claude_path）と待ち受け先（server.host / port）は、ファイルでだけ編集する
-    （Web から変えられると、tailnet 内のページから任意のコマンドを実行させられるため）。検証でも claude 本体と
+  - 起動するコマンド（collector.claude_path / codex_path）と待ち受け先（server.host / port）は、ファイルでだけ編集する
+    （Web から変えられると、tailnet 内のページから任意のコマンドを実行させられるため）。検証でも claude / codex 本体と
     ループバックだけに絞る。Web 側の確認は readonly_errors()。
 """
 
@@ -23,13 +23,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Literal
 
 import tomlkit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from tomlkit.items import AoT, InlineTable, Table
 
-from ccsmoni.model import Account
+from ccsmoni.model import Account, Provider
 
 # ---------------------------------------------------------------------------
 # 置き場所
@@ -72,25 +72,35 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _check_exe_path(v: str, name: str) -> str:
+    r"""起動できるのは name 本体だけ（PLAN §8「最低限の防御」）。ファイル名の stem で判断する
+    （claude / claude.exe / C:\...\claude.cmd など）。ネットワーク上のパスは置き換えられうるので拒否する。"""
+    s = v.strip()
+    if s.startswith(("\\\\", "//")):
+        raise ValueError(r"ネットワーク上のパス（\\ や // で始まるもの）は指定できません")
+    if PureWindowsPath(s).stem.lower() != name:
+        raise ValueError(f"{name} 本体（ファイル名が {name} のもの。例: {name}、C:\\...\\{name}.exe）だけを指定できます")
+    return s
+
+
 class CollectorConfig(_Base):
     default_interval_minutes: int = Field(10, ge=1, le=1440)
     timeout_seconds: int = Field(30, ge=5, le=300)
     concurrency: int = Field(2, ge=1, le=8)
     claude_path: str = "claude"  # ファイルでだけ編集する（Web の保存では変えられない）
+    codex_path: str = "codex"  # 同上
     discover_roots: list[str] = Field(default_factory=lambda: ["~"])
     discover_depth: int = Field(2, ge=1, le=3)
 
     @field_validator("claude_path")
     @classmethod
     def _check_claude_path(cls, v: str) -> str:
-        # 起動できるのは claude 本体だけ（PLAN §8「最低限の防御」）。ファイル名の stem で判断する
-        # （claude / claude.exe / C:\...\claude.cmd など）。ネットワーク上のパスは置き換えられうるので拒否する
-        s = v.strip()
-        if s.startswith(("\\\\", "//")):
-            raise ValueError(r"ネットワーク上のパス（\\ や // で始まるもの）は指定できません")
-        if PureWindowsPath(s).stem.lower() != "claude":
-            raise ValueError(r"claude 本体（ファイル名が claude のもの。例: claude、C:\...\claude.exe）だけを指定できます")
-        return s
+        return _check_exe_path(v, "claude")
+
+    @field_validator("codex_path")
+    @classmethod
+    def _check_codex_path(cls, v: str) -> str:
+        return _check_exe_path(v, "codex")
 
 
 class ServerConfig(_Base):
@@ -145,6 +155,8 @@ class UiConfig(_Base):
 class AccountConfig(_Base):
     id: str
     label: str = Field(min_length=1)
+    # 省略（None）= claude。"claude" は None にそろえて、ファイルには書かない（既存の設定ファイルを変えないため）
+    provider: Literal["claude", "codex"] | None = None
     config_dir: str = Field(min_length=1)  # 書いたまま保存する（~ や環境変数を含んでよい）
     launch_command: str | None = None
     # 省略 = 自動 / 整数 0〜6 = パレットの番号 / "#rrggbb" = 独自の色（resolve_colors を参照）
@@ -158,6 +170,25 @@ class AccountConfig(_Base):
         if not _ID_RE.match(v):
             raise ValueError("英数字・ハイフン・アンダースコアのみ、1〜40文字で指定してください")
         return v
+
+    @field_validator("provider")
+    @classmethod
+    def _claude_is_default(cls, v: str | None) -> str | None:
+        return None if v == "claude" else v
+
+    @property
+    def provider_kind(self) -> Provider:
+        return Provider(self.provider or "claude")
+
+    def to_account(self) -> Account:
+        """Probe 用の形に変換する。"""
+        return Account(
+            id=self.id,
+            label=self.label,
+            config_dir=self.expanded_dir(),
+            launch_command=self.launch_command,
+            provider=self.provider_kind,
+        )
 
     @field_validator("color", mode="before")
     @classmethod
@@ -199,11 +230,7 @@ class AppConfig(_Base):
 
     def active_accounts(self) -> list[Account]:
         """有効なアカウントを Probe 用の形に変換する（並び順は設定のまま）。"""
-        return [
-            Account(id=a.id, label=a.label, config_dir=a.expanded_dir(), launch_command=a.launch_command)
-            for a in self.accounts
-            if a.enabled
-        ]
+        return [a.to_account() for a in self.accounts if a.enabled]
 
     def interval_for(self, account_id: str) -> int:
         """そのアカウントの取得間隔（分）。個別指定がなければ全体の既定値。"""
@@ -279,6 +306,10 @@ def _validate(data: dict | AppConfig) -> AppConfig:
 
 # Claude の設定フォルダだと判断する目印のファイル
 _MARKERS = (".credentials.json", ".claude.json")
+# Codex の設定フォルダ（CODEX_HOME）だと判断する目印。auth.json は存在だけを見る（中身は読まない）。
+# auth.json だけでは別のツールのものと紛れるので、Codex が作るほかのもの（どれか1つ）もあることを条件にする
+_CODEX_MARKER = "auth.json"
+_CODEX_ALSO = ("config.toml", "sessions")
 
 # 深入りしない大きなディレクトリ（OS・開発ツールが作る一般的なもの）。隠しフォルダは別途すべて対象外
 _SKIP_DIRS = {
@@ -286,8 +317,13 @@ _SKIP_DIRS = {
     "program files", "program files (x86)", "windows", "$recycle.bin", "system volume information",
 }  # fmt: skip
 
-def _is_candidate(d: Path) -> bool:
-    return any((d / m).is_file() for m in _MARKERS)
+def _provider_of(d: Path) -> Provider | None:
+    """d が設定フォルダなら、その provider。どちらでもなければ None。"""
+    if any((d / m).is_file() for m in _MARKERS):
+        return Provider.CLAUDE
+    if (d / _CODEX_MARKER).is_file() and any((d / m).exists() for m in _CODEX_ALSO):
+        return Provider.CODEX
+    return None
 
 
 def short_path(p: Path) -> str:
@@ -360,9 +396,9 @@ def _safe_id(name: str) -> str:
     return s or "account"
 
 
-def _scan(root: Path, depth: int) -> list[Path]:
-    """root の下を depth 階層まで調べ、目印を持つディレクトリを返す。権限エラーなどは無視する。"""
-    found: list[Path] = []
+def _scan(root: Path, depth: int) -> list[tuple[Path, Provider]]:
+    """root の下を depth 階層まで調べ、目印を持つディレクトリとその provider を返す。権限エラーなどは無視する。"""
+    found: list[tuple[Path, Provider]] = []
 
     def walk(d: Path, level: int) -> None:
         try:
@@ -376,18 +412,19 @@ def _scan(root: Path, depth: int) -> list[Path]:
             except OSError:
                 continue
             p = Path(e.path)
-            if _is_candidate(p):
-                found.append(p)  # 候補の中身は調べない
+            provider = _provider_of(p)
+            if provider is not None:
+                found.append((p, provider))  # 候補の中身は調べない
                 continue
             if level < depth and _should_descend(e.name):
                 walk(p, level + 1)
 
     def _should_descend(name: str) -> bool:
         # 隠しフォルダ（.cache など）と巨大になりがちなフォルダには入らない。
-        # ただし名前に "claude" を含む隠しフォルダは、複数アカウントの設定フォルダをまとめる親としてよく使われるので入る
+        # ただし名前に "claude" / "codex" を含む隠しフォルダは、複数アカウントの設定フォルダをまとめる親としてよく使われるので入る
         lowered = name.lower()
         if lowered.startswith("."):
-            return "claude" in lowered
+            return "claude" in lowered or "codex" in lowered
         return lowered not in _SKIP_DIRS
 
     walk(root, 1)
@@ -424,7 +461,7 @@ def _atomic_write(path: Path, data: bytes, expect_hash: str | None = None) -> No
         raise
 
 
-_ACCOUNT_KEYS = ("id", "label", "config_dir", "launch_command", "color", "interval_minutes", "enabled")
+_ACCOUNT_KEYS = ("id", "label", "provider", "config_dir", "launch_command", "color", "interval_minutes", "enabled")
 # 既知のセクションに書いてよいキー（スキーマの項目）。保存のとき、これ以外のキーは取り除く
 _SECTION_KEYS = {
     "collector": tuple(CollectorConfig.model_fields),
@@ -433,13 +470,18 @@ _SECTION_KEYS = {
 }
 
 # Web の保存では変えられない項目（(セクション, キー)）。ファイルでだけ編集する
-READONLY_FIELDS = (("collector", "claude_path"), ("server", "host"), ("server", "port"))
+READONLY_FIELDS = (("collector", "claude_path"), ("collector", "codex_path"), ("server", "host"), ("server", "port"))
 MSG_READONLY = "この項目は設定ファイルで編集してください"
 
 
 def readonly_values(cfg: AppConfig) -> dict[str, Any]:
     """/api/config の readonly（画面では表示だけする項目）。"""
-    return {"claude_path": cfg.collector.claude_path, "host": cfg.server.host, "port": cfg.server.port}
+    return {
+        "claude_path": cfg.collector.claude_path,
+        "codex_path": cfg.collector.codex_path,
+        "host": cfg.server.host,
+        "port": cfg.server.port,
+    }
 
 
 def readonly_errors(new: dict[str, Any], current: AppConfig) -> list[tuple[str, str]]:
@@ -517,7 +559,7 @@ class ConfigService:
         out: list[dict] = []
         for r in cfg.collector.discover_roots:
             root = Path(os.path.expanduser(os.path.expandvars(r)))
-            for p in _scan(root, cfg.collector.discover_depth):
+            for p, provider in _scan(root, cfg.collector.discover_depth):
                 rp = p.resolve()
                 if rp in registered or rp in seen:
                     continue
@@ -528,7 +570,7 @@ class ConfigService:
                     sid = f"{base[:36]}-{n}"
                     n += 1
                 used_ids.add(sid)
-                out.append({"suggested_id": sid, "config_dir": short_path(p)})
+                out.append({"suggested_id": sid, "config_dir": short_path(p), "provider": str(provider)})
         return out
 
     def generate_initial(self) -> None:
@@ -541,6 +583,7 @@ class ConfigService:
                 AccountConfig(
                     id=c["suggested_id"],
                     label=c["suggested_id"],
+                    provider=c.get("provider"),
                     config_dir=c["config_dir"],
                     color=i % SLOT_COUNT,
                 )
@@ -753,6 +796,7 @@ def _render_initial(cfg: AppConfig) -> str:
             "timeout_seconds": "1回の取得を待つ上限（秒）",
             "concurrency": "同時に取得するアカウント数",
             "claude_path": "claude 本体（このファイルでだけ変更できる）",
+            "codex_path": "codex 本体（このファイルでだけ変更できる）",
             "discover_roots": "未登録アカウントを探す場所",
             "discover_depth": "探す深さ（1〜3）",
         },
@@ -777,6 +821,7 @@ def _render_initial(cfg: AppConfig) -> str:
         accounts.append(t)
     if len(accounts):
         doc.add(tomlkit.comment("監視するアカウント。id は履歴のキーなので変更しない"))
+        doc.add(tomlkit.comment('provider: 省略 = claude（config_dir は CLAUDE_CONFIG_DIR）/ "codex"（config_dir は CODEX_HOME）'))
         doc.add(tomlkit.comment('color: 省略 = 自動 / 0〜6 = パレットの番号 / "#rrggbb" = 独自の色'))
         doc.add("accounts", accounts)
     return tomlkit.dumps(doc)

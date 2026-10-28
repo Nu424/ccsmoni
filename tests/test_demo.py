@@ -21,6 +21,7 @@ def test_create_demo_home_and_live_source(tmp_path):
     assert cfg.collector.discover_roots == []  # 実環境を走査しない
     # 色: 自動・番号指定・独自の色の例が1件ずつ以上ある
     assert [a.color for a in cfg.accounts] == [None, 4, "#7c8aa5", None]
+    assert [a.provider for a in cfg.accounts] == [None, None, "codex", None]
     assert cfg.ui.tiles_per_page == 6
 
     store = Store(tmp_path / "ccsmoni.db")
@@ -30,6 +31,9 @@ def test_create_demo_home_and_live_source(tmp_path):
         assert latest["acct-d"].status == Status.LOGGED_OUT  # いまログインが切れている
         assert store.latest_ok("acct-d") is not None
         assert store.windows(kind="weekly_all")
+        # acct-c は Codex のアカウント（app-server と同じ形の raw を、本物のパーサーで読む）
+        assert latest["acct-c"].probe == "codex-app-server"
+        assert {lim.kind for lim in store.latest_ok("acct-c").limits} == {"session", "weekly_all"}
     finally:
         store.close()
 

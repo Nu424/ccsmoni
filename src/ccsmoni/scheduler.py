@@ -13,7 +13,8 @@
     PC がスリープから復帰して予定を大きく過ぎていても、その時点で1回取得するだけ（たまった分を何回も実行しない）。
     次の予定は「取得を始めた時刻 + 間隔」。それも過ぎていれば「今 + 間隔」。
   - 1回の取得で起きた例外はログに出し、status=error として保存する。ループは止めない。
-  - Probe と Store は注入する（テストでは偽物に差し替える）。Probe は設定（claude のパス・タイムアウト）から作り直す。
+  - Probe と Store は注入する（テストでは偽物に差し替える）。Probe は設定（claude / codex のパス・タイムアウト）から作り直す。
+    Probe は1つだけで、provider（claude / codex）の違いは Probe の中で振り分ける（probes/routing.py）。
   - ログには id・状態・使用率・所要時間だけを出す（raw テキストやメールアドレスは出さない）。
 """
 
@@ -28,8 +29,9 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from ccsmoni.config import AppConfig
-from ccsmoni.model import Account, RawResult, Reading, Status
+from ccsmoni.model import Account, Provider, RawResult, Reading, Status
 from ccsmoni.probes.base import Probe
+from ccsmoni.probes.routing import RoutingParser, RoutingSource
 
 log = logging.getLogger("ccsmoni.scheduler")
 
@@ -100,16 +102,21 @@ class StoreLike(Protocol):
 ProbeFactory = Callable[[AppConfig], Probe]
 
 
-def default_probe_factory(cfg: AppConfig) -> Probe:
-    """設定から本番用の Probe（claude CLI + /usage パーサー）を作る。"""
-    from ccsmoni.parser_usage import UsageTextParser
+def default_sources(cfg: AppConfig) -> RoutingSource:
+    """設定から本番用の Source（provider ごとに振り分ける）を作る。"""
     from ccsmoni.probes.cli_usage import CliUsageSource
+    from ccsmoni.probes.codex_app_server import CodexAppServerSource
 
-    return Probe(
-        name="cli-usage",
-        source=CliUsageSource(cfg.collector.claude_path, cfg.collector.timeout_seconds),
-        parser=UsageTextParser(),
-    )
+    c = cfg.collector
+    return RoutingSource({
+        Provider.CLAUDE: CliUsageSource(c.claude_path, c.timeout_seconds),
+        Provider.CODEX: CodexAppServerSource(c.codex_path, c.timeout_seconds),
+    })
+
+
+def default_probe_factory(cfg: AppConfig) -> Probe:
+    """設定から本番用の Probe（claude CLI の /usage・codex app-server と、それぞれのパーサー）を作る。"""
+    return Probe(name="cli", source=default_sources(cfg), parser=RoutingParser())
 
 
 def summarize(reading: Reading, duration_ms: int | None = None) -> str:
@@ -184,7 +191,7 @@ class Scheduler:
             interval = cfg.interval_for(aid) * 60
             if old is None or initial:
                 self._next[aid] = now  # 追加されたアカウント・起動直後は、すぐに取得する
-            elif old.config_dir != acc.config_dir:
+            elif (old.config_dir, old.provider) != (acc.config_dir, acc.provider):
                 self._next[aid] = now  # 取得先が変わったので取り直す
                 if aid in self._tasks:
                     self._again.add(aid)  # 取得中の結果は古い取得先のもの。終わったらすぐ取り直す
@@ -198,10 +205,11 @@ class Scheduler:
         """設定の変更を反映する（ConfigService.poll や UI からの保存のあとに呼ぶ）。"""
         old = self._cfg
         self._cfg = cfg
-        if (old.collector.claude_path, old.collector.timeout_seconds) != (
-            cfg.collector.claude_path,
-            cfg.collector.timeout_seconds,
-        ):
+
+        def probe_key(c: AppConfig) -> tuple:
+            return (c.collector.claude_path, c.collector.codex_path, c.collector.timeout_seconds)
+
+        if probe_key(old) != probe_key(cfg):
             self._probe = self.probe_factory(cfg)
         if old.collector.concurrency != cfg.collector.concurrency:
             # 実行中のものはそのまま終わる。新しく始める分から新しい上限で数える（同じカウンタなので超えない）

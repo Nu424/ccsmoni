@@ -33,14 +33,26 @@ class Status(StrEnum):
     PARSE_ERROR = "parse_error"  # 出力は得られたが読めなかった（形式が変わった可能性）
 
 
+class Provider(StrEnum):
+    """どの CLI のアカウントか。"""
+
+    CLAUDE = "claude"
+    CODEX = "codex"
+
+
+# provider ごとの、設定フォルダを渡す環境変数
+CONFIG_DIR_ENV = {Provider.CLAUDE: "CLAUDE_CONFIG_DIR", Provider.CODEX: "CODEX_HOME"}
+
+
 @dataclass(frozen=True)
 class Account:
     """監視対象のアカウント（設定から作られる）。Probe が必要とする最小限の情報だけを持つ。"""
 
     id: str  # 履歴のキー。変更しない
     label: str
-    config_dir: Path  # CLAUDE_CONFIG_DIR に渡す（展開済みの絶対パス）
+    config_dir: Path  # CLAUDE_CONFIG_DIR / CODEX_HOME に渡す（展開済みの絶対パス）
     launch_command: str | None = None  # 案内・コピー用（例: "claude-xxx"）
+    provider: Provider = Provider.CLAUDE
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,7 @@ import sys
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="ccsmoni", description="Claude Code の利用状況モニター（非公式）")
+    p = argparse.ArgumentParser(prog="ccsmoni", description="Claude Code・Codex の利用状況モニター（非公式）")
     sub = p.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve", help="常駐して定期取得し、ダッシュボードを配信する")
     serve.add_argument("--port", type=int, help="待ち受けるポート（省略時は設定の server.port）")
@@ -16,10 +16,11 @@ def build_parser() -> argparse.ArgumentParser:
     parse = sub.add_parser("parse", help="保存済みの /usage テキストを読み、Reading の JSON を出力する")
     parse.add_argument("file", help="/usage の出力を保存したテキストファイル")
     parse.add_argument("--taken-at", help="取得時刻（ISO 8601。省略時は現在時刻）")
-    collect = sub.add_parser("collect", help="claude CLI で各アカウントの /usage を取得する")
+    collect = sub.add_parser("collect", help="claude / codex CLI で各アカウントの使用率を取得する")
     collect.add_argument("--once", action="store_true", help="1回だけ取得して終了する")
     collect.add_argument("--print", action="store_true", dest="print_table", help="結果を表で表示する")
-    collect.add_argument("--config-dir", action="append", help="CLAUDE_CONFIG_DIR（複数指定可。id はディレクトリ名）。省略時は設定の有効なアカウント")
+    collect.add_argument("--config-dir", action="append", help="CLAUDE_CONFIG_DIR（--codex なら CODEX_HOME。複数指定可。id はディレクトリ名）。省略時は設定の有効なアカウント")
+    collect.add_argument("--codex", action="store_true", help="--config-dir を Codex の設定フォルダとして扱う")
     collect.add_argument("--save", action="store_true", help="結果を DB に保存する")
     sub.add_parser("reparse", help="保存済みの raw をパーサーで読み直し、DB の解釈結果を作り直す")
     sub.add_parser(
@@ -69,7 +70,7 @@ def _cmd_collect(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from ccsmoni.config import AppConfig, config_path, db_path
-    from ccsmoni.model import Account
+    from ccsmoni.model import Account, Provider
     from ccsmoni.scheduler import default_probe_factory
 
     # ディレクトリを直接指定したときは、設定ファイルが無くても作らない（既定値で取得する）
@@ -82,7 +83,8 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         accounts = []
         for d in args.config_dir:
             path = Path(d).expanduser().resolve()
-            accounts.append(Account(id=path.name, label=path.name, config_dir=path))
+            provider = Provider.CODEX if args.codex else Provider.CLAUDE
+            accounts.append(Account(id=path.name, label=path.name, config_dir=path, provider=provider))
     else:
         accounts = cfg.active_accounts()
         if not accounts:
@@ -126,7 +128,7 @@ def _cmd_collect(args: argparse.Namespace) -> int:
 
 def _cmd_reparse(args: argparse.Namespace) -> int:
     from ccsmoni.config import db_path
-    from ccsmoni.parser_usage import UsageTextParser
+    from ccsmoni.probes.routing import RoutingParser
     from ccsmoni.store import Store
 
     if not db_path().exists():
@@ -134,7 +136,7 @@ def _cmd_reparse(args: argparse.Namespace) -> int:
         return 1
     store = Store(db_path())
     try:
-        n = store.reparse(UsageTextParser())
+        n = store.reparse(RoutingParser())
     finally:
         store.close()
     print(f"{n} 件を読み直しました")

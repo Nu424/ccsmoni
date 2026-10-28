@@ -40,6 +40,6 @@ export const api = {
   refresh: (accountId) => req("POST", "/api/refresh", accountId ? { account_id: accountId } : {}),
   getConfig: () => req("GET", "/api/config"),
   putConfig: (config, hash) => req("PUT", "/api/config", { config, hash }),
-  testAccount: (configDir) => req("POST", "/api/accounts/test", { config_dir: configDir }),
+  testAccount: (configDir, provider) => req("POST", "/api/accounts/test", { config_dir: configDir, provider: provider || "claude" }),
   login: (id) => req("POST", `/api/accounts/${encodeURIComponent(id)}/login`, {}),
 };

@@ -414,3 +414,60 @@ def test_short_path(tmp_path):
     assert short_path(Path.home()) == "~"
     outside = Path(Path.home().anchor) / "definitely-outside-home-xyz"
     assert short_path(outside) == str(outside)
+
+
+# ---------------------------------------------------------------- Codex（provider）
+
+
+@pytest.mark.parametrize("path", ["codex", "codex.exe", r"C:\Users\x\AppData\Local\Programs\OpenAI\Codex\bin\codex.EXE"])
+def test_codex_path_accepts_codex_only(path):
+    assert AppConfig.model_validate({"collector": {"codex_path": path}}).collector.codex_path == path
+
+
+@pytest.mark.parametrize("path", ["claude", "codex-evil.exe", r"\\server\share\codex.exe", ""])
+def test_codex_path_rejects_others(path):
+    with pytest.raises(ValueError):
+        AppConfig.model_validate({"collector": {"codex_path": path}})
+
+
+def test_readonly_errors_detect_codex_path():
+    cur = AppConfig()
+    new = cur.model_dump()
+    new["collector"]["codex_path"] = "C:/evil/codex.exe"
+    assert readonly_errors(new, cur) == [("collector.codex_path", "この項目は設定ファイルで編集してください")]
+
+
+def test_provider_is_saved_only_for_codex(svc):
+    write(svc, HAND_WRITTEN)
+    cfg, h = svc.load()
+    d = cfg.model_dump()
+    d["accounts"][0]["provider"] = "claude"  # 既定値。ファイルには書かない
+    d["accounts"].append({"id": "cx", "label": "Codex", "provider": "codex", "config_dir": "~/.codex"})
+    svc.save(d, h)
+    text = svc.path.read_text(encoding="utf-8")
+    assert text.count("provider") == 1 and 'provider = "codex"' in text
+    cfg2, _ = svc.load()
+    assert cfg2.accounts[0].provider is None
+    acc = {a.id: a for a in cfg2.active_accounts()}
+    assert acc["cx"].provider == "codex" and acc[cfg2.accounts[0].id].provider == "claude"
+    with pytest.raises(ConfigValidationError):
+        svc.save({**d, "accounts": [{"id": "x", "label": "x", "provider": "gemini", "config_dir": "~/x"}]}, svc.current_hash)
+
+
+def test_discovers_codex_homes(tmp_path):
+    roots = tmp_path / "roots"
+    (roots / ".codex").mkdir(parents=True)
+    (roots / ".codex" / "auth.json").write_text("{}")
+    (roots / ".codex" / "config.toml").write_text("")
+    (roots / ".codex-accts" / "work" / "sessions").mkdir(parents=True)  # 名前に codex を含む隠しフォルダの中も探す
+    (roots / ".codex-accts" / "work" / "auth.json").write_text("{}")
+    (roots / "other-tool").mkdir()
+    (roots / "other-tool" / "auth.json").write_text("{}")  # auth.json だけでは Codex とみなさない
+    (roots / ".claude").mkdir()
+    (roots / ".claude" / ".claude.json").write_text("{}")
+    svc = ConfigService(tmp_path / "home" / "config.toml", discover_roots=[str(roots)])
+    cands = svc.discover_candidates(AppConfig.model_validate({"collector": {"discover_roots": [str(roots)]}}))
+    by_dir = {Path(c["config_dir"]).name: c["provider"] for c in cands}
+    assert by_dir == {".codex": "codex", "work": "codex", ".claude": "claude"}
+    loaded, _ = svc.load()
+    assert sorted((a.id, a.provider) for a in loaded.accounts) == [("claude", None), ("codex", "codex"), ("work", "codex")]

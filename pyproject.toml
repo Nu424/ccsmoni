@@ -1,7 +1,7 @@
 [project]
 name = "ccsmoni"
 version = "0.1.0"
-description = "複数の Claude Code アカウントの利用状況（5時間枠・週間枠）を記録し、推移を可視化する非公式のモニター"
+description = "複数の Claude Code・Codex アカウントの利用状況（5時間枠・週間枠）を記録し、推移を可視化する非公式のモニター"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

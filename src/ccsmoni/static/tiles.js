@@ -66,12 +66,13 @@ export function createTile(id, env) {
 
     // ---- 1段目 ----
     const busy = env.busy().has(a.id);
-    const hk = JSON.stringify([a.label, a.plan, a.status, busy, a.stale, a.status_since, a.taken_at, a.enabled, !!a._dup]);
+    const hk = JSON.stringify([a.label, a.provider, a.plan, a.status, busy, a.stale, a.status_since, a.taken_at, a.enabled, !!a._dup]);
     if (force || hk !== keys.head) {
       keys.head = hk;
       keepFocus(head, () => setChildren(head,
         h("span.sw", { title: a._dup ? "ほかのアカウントと同じ色です（重ねる表示では破線）" : null }),
         h("h3", { title: a.id }, a.label),
+        a.provider === "codex" ? h("span.plan.prov", { title: "Codex のアカウント" }, "Codex") : null,
         a.plan ? h("span.plan", a.plan.toUpperCase()) : null,
         stateBadge(a, now, busy),
         h("button.t-refresh", { type: "button", title: "このアカウントを今すぐ更新", "aria-label": `${a.label} を今すぐ更新`, dataset: { fk: "refresh" },
@@ -269,8 +270,13 @@ export function createTile(id, env) {
     const manualBtn = h("button.man-btn", { type: "button", "aria-expanded": String(popOpen), title: "手動でログインする方法", dataset: { fk: "manual" },
       onclick: (e) => { e.stopPropagation(); popOpen = !popOpen; update(last); } }, "手動");
     const pop = popOpen ? h("div.pop", { role: "dialog", "aria-label": "手動でログインする方法", onclick: (e) => e.stopPropagation() }, [
-      h("p", a.launch_command ? "手動でするなら、起動してから /login:" : "このアカウントの設定フォルダで claude を起動して /login:"),
-      h("div.pop-row", [a.launch_command ? copyCmd(a.launch_command) : h("code", "claude"), h("span", "→"), h("code", "/login")]),
+      ...(a.provider === "codex" ? [
+        h("p", "手動でするなら、このアカウントの設定フォルダを CODEX_HOME にして:"),
+        h("div.pop-row", [a.launch_command ? copyCmd(a.launch_command) : h("code", "codex login")]),
+      ] : [
+        h("p", a.launch_command ? "手動でするなら、起動してから /login:" : "このアカウントの設定フォルダで claude を起動して /login:"),
+        h("div.pop-row", [a.launch_command ? copyCmd(a.launch_command) : h("code", "claude"), h("span", "→"), h("code", "/login")]),
+      ]),
     ]) : null;
     let kids;
     if (retaking) { hint.classList.add("okk"); kids = [spinner(), h("span", "ログインしました。取り直しています…")]; }

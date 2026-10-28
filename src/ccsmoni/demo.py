@@ -6,10 +6,10 @@
 方針:
   - 利用のモデルは決定的（アカウントごとの乱数の種で、10 分刻みに状態を進める）。
     履歴の生成と serve 中の取得は同じモデルを使うので、DB の続きとして自然につながる。
-  - 生成するのは /usage と同じ形式のテキストと auth status 相当の meta。保存は本物のパーサー → Store を通す
-    （raw も本物と同じ形なので reparse もできる）。
+  - 生成するのは /usage と同じ形式のテキストと auth status 相当の meta（Codex のアカウントは app-server の
+    rateLimits と同じ形の JSON）。保存は本物のパーサー → Store を通す（raw も本物と同じ形なので reparse もできる）。
   - 見せたいもの: 5h 枠のノコギリ形、週間枠の増加とリセット、PC のスリープによる抜け、ログイン切れの期間、
-    プランの違い、「使わないと損」「上限に達しそう」のヒント、モデル別の週間枠。
+    プランの違い、「使わないと損」「上限に達しそう」のヒント、モデル別の週間枠、Codex のアカウント。
   - config_dir は存在しない架空のパス。未登録の検出（discover_roots）は空にして、実環境を走査しない。
 """
 
@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ccsmoni.model import Account, RawResult
+from ccsmoni.model import Account, Provider, RawResult
+from ccsmoni.probes.codex_app_server import KIND as CODEX_KIND
+from ccsmoni.probes.codex_app_server import account_hash
 
 DEMO_MARKER = "demo.json"  # CCSMONI_HOME にこれがあるときだけ serve --demo を許す（実データに混ぜないため）
 STEP = 600  # 10 分
@@ -50,6 +52,7 @@ class DemoSpec:
     logged_out: tuple[tuple[float, float | None], ...] = ()  # ログイン切れの期間（作成時刻からの時間。None = 続いている）
     busy_now: bool = False  # 作成時刻の直前は使っていることにする（画面が寂しくならないように）
     interval_minutes: int | None = None
+    provider: Provider = Provider.CLAUDE
 
 
 SPECS: tuple[DemoSpec, ...] = (
@@ -59,9 +62,9 @@ SPECS: tuple[DemoSpec, ...] = (
     DemoSpec("acct-b", "仕事", "max", 4,  # 番号指定の例
              "work", 3.2, 0.10, 5.2 * 24, model_week="Sonnet",
              busy_now=True, interval_minutes=5),
-    # 検証用（Max）: たまにしか使わない。リセットが近いのに余っている → 「使わないと損」。途中でログイン切れ
-    DemoSpec("acct-c", "検証用", "max", "#7c8aa5",  # 独自の色の例
-             "light", 2.5, 0.09, 20, logged_out=((-13 * 24, -10.5 * 24),)),
+    # Codex（Plus）: たまにしか使わない。リセットが近いのに余っている → 「使わないと損」。途中でログイン切れ
+    DemoSpec("acct-c", "検証用", "plus", "#7c8aa5",  # 独自の色の例
+             "light", 2.5, 0.09, 20, logged_out=((-13 * 24, -10.5 * 24),), provider=Provider.CODEX),
     # チーム（Team）: 平日の日中。いまログインが切れている
     DemoSpec("acct-d", "チーム", "team", None, "work", 3.5, 0.075, 2.4 * 24, logged_out=((-38, None),)),
 )
@@ -237,9 +240,36 @@ def render_usage(s: _State, spec: DemoSpec) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _raw(model: DemoModel, t: float, rng: random.Random) -> RawResult:
-    """時刻 t の取得結果（本物の CliUsageSource と同じ形）。"""
+def render_rate_limits(s: _State, spec: DemoSpec) -> str:
+    """app-server の rateLimits/read の結果（CodexAppServerSource が残す項目だけ）。"""
+    session = {"usedPercent": round(s.session_pct), "windowDurationMins": 300,
+               "resetsAt": int(s.session_reset) if s.session_reset is not None else None}
+    week = {"usedPercent": round(s.week_pct), "windowDurationMins": 10080, "resetsAt": int(s.week_reset)}
+    snap = {"limitId": "codex", "limitName": None, "primary": session, "secondary": week,
+            "planType": spec.plan, "rateLimitReachedType": None}
+    return json.dumps({"rateLimits": snap, "rateLimitsByLimitId": {"codex": snap}, "ordinaryUsageAllowed": True})
+
+
+def _codex_raw(model: DemoModel, t: float, rng: random.Random) -> RawResult:
+    """時刻 t の取得結果（本物の CodexAppServerSource と同じ形）。"""
     spec = model.spec
+    started = datetime.fromtimestamp(t, UTC)
+    meta: dict[str, Any] = {"cli_version": "0.100.0 (demo)"}
+    if not model.logged_in(t):
+        meta["auth"] = {"loggedIn": False}
+        return RawResult(CODEX_KIND, started, int(300 + rng.random() * 200), "", exit_code=0, meta=meta)
+    if rng.random() < 0.003:
+        return RawResult(CODEX_KIND, started, 30000, "", exit_code=None, timed_out=True, meta=meta)
+    meta["auth"] = {"loggedIn": True, "authMethod": "chatgpt", "planType": spec.plan, "orgId": account_hash(f"demo-{spec.id}")}
+    s = model.advance(t)
+    return RawResult(CODEX_KIND, started, int(2500 + rng.random() * 1500), render_rate_limits(s, spec), exit_code=0, meta=meta)
+
+
+def _raw(model: DemoModel, t: float, rng: random.Random) -> RawResult:
+    """時刻 t の取得結果（本物の CliUsageSource / CodexAppServerSource と同じ形）。"""
+    spec = model.spec
+    if spec.provider == Provider.CODEX:
+        return _codex_raw(model, t, rng)
     started = datetime.fromtimestamp(t, UTC)
     meta: dict[str, Any] = {"cli_version": "2.0.0 (Claude Code, demo)"}
     if not model.logged_in(t):
@@ -294,6 +324,8 @@ class DemoSource:
         m = self._model(account.id)
         ok = m.logged_in(self.clock())
         spec = m.spec
+        if spec.provider == Provider.CODEX:
+            return {"loggedIn": ok, "orgId": account_hash(f"demo-{spec.id}") if ok else None}
         return {"loggedIn": ok, "orgId": f"00000000-0000-4000-8000-demo{_seed(spec.id) % 100000000:08d}" if ok else None}
 
     def mark_login_soon(self, account_id: str, seconds: float = 6.0) -> None:
@@ -311,7 +343,7 @@ class DemoConsole:
         return None
 
 
-DEMO_CANDIDATES = [{"suggested_id": "acct-new", "config_dir": "~/claude-demo/acct-new"}]  # --accounts で増やすアカウントと id が重ならないように
+DEMO_CANDIDATES = [{"suggested_id": "acct-new", "config_dir": "~/claude-demo/acct-new", "provider": "claude"}]  # --accounts で増やすアカウントと id が重ならないように
 
 
 # ---------------------------------------------------------------- ccsmoni demo --home
@@ -325,7 +357,7 @@ def create_demo_home(
         raise ValueError(f"accounts は {MIN_ACCOUNTS}〜{MAX_ACCOUNTS} で指定してください")
     specs = (SPECS + EXTRA_SPECS)[:accounts]
     from ccsmoni.config import AccountConfig, ConfigService
-    from ccsmoni.parser_usage import UsageTextParser
+    from ccsmoni.probes.routing import RoutingParser
     from ccsmoni.store import Store
 
     home = Path(home)
@@ -350,8 +382,9 @@ def create_demo_home(
         AccountConfig(
             id=s.id,
             label=s.label,
-            config_dir=f"~/claude-demo/{s.id}",
-            launch_command=f"claude-{s.id}",
+            provider=str(s.provider),
+            config_dir=f"~/{s.provider}-demo/{s.id}",
+            launch_command=f"claude-{s.id}" if s.provider == Provider.CLAUDE else None,
             color=s.color,
             interval_minutes=s.interval_minutes,
         )
@@ -361,7 +394,7 @@ def create_demo_home(
 
     store = Store(db_file)
     store._conn.execute("PRAGMA synchronous=OFF")  # 大量の挿入を速くする（デモの生成時だけ）
-    parser = UsageTextParser()
+    parser = RoutingParser()
     counts: dict[str, int] = {}
     try:
         for spec in specs:

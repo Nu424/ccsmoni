@@ -37,6 +37,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
     {
       "id": "acct-a",
       "label": "個人",
+      "provider": "claude",           // "claude" | "codex"
       "color_slot": 0,                // パレットの番号（0〜6）。独自の色（#rrggbb）を指定しているときは null。自動の割り当てでも必ず入る
       "color": null,                  // 独自の色（"#rrggbb"）を指定しているときだけ。それ以外は null（下記「色の割り当て」）
       "enabled": true,
@@ -51,6 +52,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
       "plan": "max",                  // null 可
       "limits": [                     // status=ok のときの値。ok 以外では []
         {
+          // kind は provider によらず同じ（Codex も session / weekly_all にそろえる。docs/design/CODEX.md）。label は CLI の表記
           "kind": "session", "label": "Current session", "percent": 47.0, "resets_at": 1793050000,
           "pace": {                   // insights が計算。resets_at が無ければ null
             "elapsed_ratio": 0.62,    // 枠の経過割合（0〜1）。5h 枠=5時間、週間枠=7日として計算
@@ -84,7 +86,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
     { "id": "acct-old", "label": "acct-old", "color_slot": 3, "color": null }   // label は id。色は下記「色の割り当て」（accounts と同じ形）
   ],
   "candidates": [                     // 未登録のアカウント候補（設定画面と、トップの控えめな通知に使う）
-    { "suggested_id": "acct-x", "config_dir": "~/somewhere/acct-x" }
+    { "suggested_id": "acct-x", "config_dir": "~/somewhere/acct-x", "provider": "claude" }   // provider: "claude" | "codex"
   ]
 }
 ```
@@ -163,7 +165,7 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
   },
   "history_ids": ["acct-a", "acct-b", "acct-old"],          // DB に履歴がある id（昇順）。新しいアカウントの id がこれと重なれば
                                                              // UI は「この id には過去の履歴があります」と警告する
-  "readonly": { "claude_path": "claude", "host": "127.0.0.1", "port": 8484 }   // ファイルでだけ編集できる項目（UI は表示だけ）
+  "readonly": { "claude_path": "claude", "codex_path": "codex", "host": "127.0.0.1", "port": 8484 }   // ファイルでだけ編集できる項目（UI は表示だけ）
 }
 ```
 
@@ -184,12 +186,12 @@ UI はこれを 15 秒ごとに取得する。更新中（`collector.busy` が�
 - 422 `{"error": "入力内容に誤りがあります", "fields": [["accounts.0.color", "色は 0〜6 の番号か #rrggbb の形式で指定してください"]]}`
   - 書き出す予定の TOML 全体を、読み込みと同じ検証に通してから置き換える。通らなければ（例: 未知のセクションが残っている）422 で、ファイルは変わらない
 - 422 `{"error": "この項目は設定ファイルで編集してください", "fields": [["collector.claude_path", "この項目は設定ファイルで編集してください"]]}`
-  - `collector.claude_path`・`server.host`・`server.port` は Web から変えられない（任意のコマンドの実行・外部への公開を防ぐため）。いまの値と違う値が来たら 422。省略すればいまの値のまま
-  - ファイルで編集する場合も、`claude_path` はファイル名の stem が `claude`（大文字小文字は問わない）のものだけ（UNC パス `\\server\...`・`//server/...` は不可）、`host` はループバック（127.0.0.1 / ::1 / localhost）だけ。host / port の変更は再起動するまで反映されない
+  - `collector.claude_path`・`collector.codex_path`・`server.host`・`server.port` は Web から変えられない（任意のコマンドの実行・外部への公開を防ぐため）。いまの値と違う値が来たら 422。省略すればいまの値のまま
+  - ファイルで編集する場合も、`claude_path` / `codex_path` はファイル名の stem が `claude` / `codex`（大文字小文字は問わない）のものだけ（UNC パス `\\server\...`・`//server/...` は不可）、`host` はループバック（127.0.0.1 / ::1 / localhost）だけ。host / port の変更は再起動するまで反映されない
 
 ## POST /api/accounts/test — 接続テスト（保存しない）
 
-本文 `{"config_dir": "~/x/acct-a"}` → 1 回だけ取得し、`{"status": "ok", "message": null, "plan": "max", "limits": [...]}` を返す。DB には保存しない。
+本文 `{"config_dir": "~/x/acct-a", "provider": "claude"}`（provider は `"claude"` か `"codex"`。省略すると claude）→ 1 回だけ取得し、`{"status": "ok", "message": null, "plan": "max", "limits": [...]}` を返す。DB には保存しない。
 - 同時に1件まで。実行中に2件目が来たら 429 `{"error": "接続テストを実行中です"}`
 
 ## POST /api/accounts/{id}/login — ログイン

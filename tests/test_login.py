@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 from ccsmoni.login import LoginService
-from ccsmoni.model import Account
+from ccsmoni.model import Account, Provider
 
 ACCOUNT = Account(id="acct-a", label="A", config_dir=Path("/x/acct-a"))
+CODEX_ACCOUNT = Account(id="codex-a", label="C", config_dir=Path("/x/codex-a"), provider=Provider.CODEX)
 
 
 class FakeProc:
@@ -30,7 +31,7 @@ class Harness:
         self.proc = FakeProc()
         self.popen_error = popen_error
         self.svc = LoginService(
-            command=lambda: ["C:/fake/claude.exe"],
+            command=lambda a: [f"C:/fake/{a.provider}.exe"],
             auth_status=lambda a: self.status,
             last_org_id=lambda aid: last_org,
             on_logged_in=self.refreshed.append,
@@ -77,6 +78,24 @@ def test_start_opens_new_console_without_shell_and_completes():
         h.status = {"loggedIn": True, "orgId": "org-1"}
         await wait_state(h, "done")
         assert h.refreshed == ["acct-a"]
+
+    asyncio.run(main())
+
+
+def test_codex_opens_codex_login_with_codex_home():
+    async def main():
+        h = Harness()
+        assert h.svc.start(CODEX_ACCOUNT)["state"] == "waiting"
+        (args, kw), = h.popen_calls
+        assert args == ["C:/fake/codex.exe", "login"]
+        assert kw["env"]["CODEX_HOME"] == str(CODEX_ACCOUNT.config_dir)
+        h.status = {"loggedIn": True, "orgId": "org-1"}
+        for _ in range(500):
+            s = h.svc.state(CODEX_ACCOUNT.id)
+            if s["state"] == "done":
+                break
+            await asyncio.sleep(0.005)
+        assert h.refreshed == ["codex-a"]
 
     asyncio.run(main())
 
